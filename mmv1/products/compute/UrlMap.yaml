@@ -122,6 +122,14 @@ examples:
       http_health_check_name: 'health-check'
       storage_bucket_name: 'static-asset-bucket'
       error_backend_bucket_name: 'error-backend-bucket'
+  - name: 'url_map_route_rules_description'
+    primary_resource_id: 'urlmap'
+    vars:
+      url_map_name: 'urlmap'
+      default_backend_service_name: 'default'
+      service_a_backend_service_name: 'service-a'
+      service_b_backend_service_name: 'service-b'
+      health_check_name: 'health-check'
 parameters:
 properties:
   - name: 'creationTimestamp'
@@ -1783,6 +1791,12 @@ properties:
                       If load balancer cannot reach the backendBucket, a simple Not Found Error will be returned, with the original response code (or overrideResponseCode if configured).
                     resource: 'BackendBucket'
                     imports: 'selfLink'
+              - name: 'description'
+                type: String
+                description: |
+                  An optional description of this resource. Provide this property when you create the resource.
+                  This field can be set only at creation time. It cannot be changed after the resource is created.
+                  The value must be 0 to 1024 characters long.
         - name: 'defaultUrlRedirect'
           type: NestedObject
           # TODO: (mbang) won't work for array path matchers yet, uncomment here once they are supported.
