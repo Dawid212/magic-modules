@@ -1,0 +1,3020 @@
+package compute_test
+
+import (
+	"context"
+	"fmt"
+	"path"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
+
+	"github.com/hashicorp/terraform-provider-google/google/acctest"
+	"github.com/hashicorp/terraform-provider-google/google/envvar"
+
+{{ if eq $.TargetVersionName `ga` }}
+	compute "google.golang.org/api/compute/v1"
+{{- else }}
+	compute "google.golang.org/api/compute/v0.beta"
+{{- end }}
+)
+
+func TestAccComputeBulkInstance_basic(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_basic(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.basic", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.basic", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.basic", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.basic", testAccCheckComputeBulkInstanceHasMachineType("e2-medium")),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_multipleInstances(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_multipleInstances(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.multiple", "current_instance_count", "2"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.multiple", "instance_names.#", "2"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.multiple", 2),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.multiple", testAccCheckComputeBulkInstanceHasMachineType("e2-micro")),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_perInstanceProperties(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_perInstanceProperties(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.named", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.named", "instance_names.#", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.named", "instance_names.0", fmt.Sprintf("tf-test-bulk-named-%s", context["random_suffix"])),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.named", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.named", func(inst *compute.Instance) error {
+						if err := testAccCheckComputeBulkInstanceHasName(fmt.Sprintf("tf-test-bulk-named-%s", context["random_suffix"]))(inst); err != nil {
+							return err
+						}
+						return testAccCheckComputeBulkInstanceHasMachineType("e2-medium")(inst)
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_minCount(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_minCount(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.min_count", "current_instance_count", "2"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.min_count", "instance_names.#", "2"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.min_count", 2),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.min_count", testAccCheckComputeBulkInstanceHasMachineType("e2-micro")),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_metadataStartupScript(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_metadataStartupScript(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.startup_script", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.startup_script", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.startup_script", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.startup_script", func(instance *compute.Instance) error {
+						return bulkRunInstanceCheck(instance, testAccCheckComputeInstanceMetadata(instance, "startup-script", "echo bulk-startup"))
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_serviceAccount(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_serviceAccount(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.with_service_account", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.with_service_account", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.with_service_account", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.with_service_account", func(instance *compute.Instance) error {
+						if len(instance.ServiceAccounts) != 1 {
+							return fmt.Errorf("expected 1 service account, got %#v", instance.ServiceAccounts)
+						}
+						if len(instance.ServiceAccounts[0].Scopes) != 2 {
+							return fmt.Errorf("expected 2 scopes, got %#v", instance.ServiceAccounts[0].Scopes)
+						}
+						return nil
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_resourceManagerTags(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+		"project":       envvar.GetTestProjectFromEnv(),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_resourceManagerTags(context),
+				// No instances.get assertion for resource manager tags: compute.Instance in the
+				// Go client has no ResourceManagerTags field (tags are set via params at create).
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.resource_manager_tags", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.resource_manager_tags", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.resource_manager_tags", 1),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_reservationAffinitySpecificMissing(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccComputeBulkInstance_reservationAffinitySpecificMissing(context),
+				ExpectError: regexp.MustCompile(`specific_reservation must be set when reservation_affinity is SPECIFIC_RESERVATION`),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_full(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_full(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.full", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.full", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.full", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.full", testAccCheckComputeBulkInstanceFullInstanceAPI),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_sourceInstanceTemplate(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_sourceInstanceTemplate(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.template", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.template", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.template", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.template", func(instance *compute.Instance) error {
+						if err := testAccCheckComputeBulkInstanceHasMachineType("e2-medium")(instance); err != nil {
+							return err
+						}
+						return bulkRunInstanceCheck(instance, testAccCheckComputeInstanceTag(instance, "bulk-template"))
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_sourceInstanceTemplateOverrides(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_sourceInstanceTemplateOverrides(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.template_override", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.template_override", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.template_override", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.template_override", func(instance *compute.Instance) error {
+						if instance.Description != "Bulk override description" {
+							return fmt.Errorf("expected override description, got %q", instance.Description)
+						}
+						if err := testAccCheckComputeBulkInstanceHasMachineType("e2-small")(instance); err != nil {
+							return err
+						}
+						if err := bulkRunInstanceCheck(instance, testAccCheckComputeInstanceTag(instance, "bulk-override")); err != nil {
+							return err
+						}
+						if err := bulkRunInstanceCheck(instance, testAccCheckComputeInstanceMetadata(instance, "source", "bulk-override")); err != nil {
+							return err
+						}
+						return bulkRunInstanceCheck(instance, testAccCheckComputeInstanceLabel(instance, "bulk_override_label", "yes"))
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_advancedMachineFeaturesExpanded(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_advancedMachineFeaturesExpanded(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.advanced_machine_features", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.advanced_machine_features", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.advanced_machine_features", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.advanced_machine_features", func(instance *compute.Instance) error {
+						if err := testAccCheckComputeBulkInstanceHasMachineType("c4-standard-2")(instance); err != nil {
+							return err
+						}
+						amf := instance.AdvancedMachineFeatures
+						if amf == nil {
+							return fmt.Errorf("expected advanced_machine_features on API instance")
+						}
+						if !amf.EnableNestedVirtualization {
+							return fmt.Errorf("expected EnableNestedVirtualization true, got %#v", amf)
+						}
+						if amf.ThreadsPerCore != 1 {
+							return fmt.Errorf("expected ThreadsPerCore 1, got %d", amf.ThreadsPerCore)
+						}
+						if amf.TurboMode != "ALL_CORE_MAX" {
+							return fmt.Errorf("expected TurboMode ALL_CORE_MAX, got %q", amf.TurboMode)
+						}
+						if amf.VisibleCoreCount != 1 {
+							return fmt.Errorf("expected VisibleCoreCount 1, got %d", amf.VisibleCoreCount)
+						}
+						return nil
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_spot(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_spot(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.spot", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.spot", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.spot", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.spot", func(instance *compute.Instance) error {
+						if instance.Scheduling == nil {
+							return fmt.Errorf("expected scheduling on spot instance")
+						}
+						if instance.Scheduling.ProvisioningModel != "SPOT" {
+							return fmt.Errorf("expected ProvisioningModel SPOT, got %q", instance.Scheduling.ProvisioningModel)
+						}
+						if !instance.Scheduling.Preemptible {
+							return fmt.Errorf("expected Preemptible true on spot instance")
+						}
+						wantMaxRun := compute.Duration{Seconds: 3600, Nanos: 0}
+						if err := bulkRunInstanceCheck(instance, testAccCheckComputeInstanceMaxRunDuration(instance, wantMaxRun)); err != nil {
+							return err
+						}
+						return bulkRunInstanceCheck(instance, testAccCheckComputeInstanceTerminationAction(instance, "STOP"))
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_extendedSpotScheduling(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_extendedSpotScheduling(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.extended_spot", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.extended_spot", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.extended_spot", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.extended_spot", func(instance *compute.Instance) error {
+						if instance.Scheduling == nil || instance.Scheduling.ProvisioningModel != "SPOT" {
+							return fmt.Errorf("expected SPOT provisioning, got %#v", instance.Scheduling)
+						}
+						wantMaxRun := compute.Duration{Seconds: 180, Nanos: 123}
+						if err := bulkRunInstanceCheck(instance, testAccCheckComputeInstanceMaxRunDuration(instance, wantMaxRun)); err != nil {
+							return err
+						}
+						if instance.Scheduling.OnInstanceStopAction == nil || !instance.Scheduling.OnInstanceStopAction.DiscardLocalSsd {
+							return fmt.Errorf("expected on_instance_stop_action.discard_local_ssd true, got %#v", instance.Scheduling.OnInstanceStopAction)
+						}
+						return bulkRunInstanceCheck(instance, testAccCheckComputeInstanceTerminationAction(instance, "STOP"))
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_scratchDisk(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_scratchDisk(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.scratch", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.scratch", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.scratch", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.scratch", func(instance *compute.Instance) error {
+						return bulkRunInstanceCheck(instance, testAccCheckComputeInstanceScratchDisk(instance, []map[string]string{
+							{"interface": "NVME", "deviceName": "local-ssd-0"},
+						}))
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_localSsdRecoveryTimeout(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_localSsdRecoveryTimeout(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.local_ssd_recovery", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.local_ssd_recovery", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.local_ssd_recovery", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.local_ssd_recovery", func(instance *compute.Instance) error {
+						want := compute.Duration{Seconds: 3600, Nanos: 0}
+						return bulkRunInstanceCheck(instance, testAccCheckComputeInstanceLocalSsdRecoveryTimeout(instance, want))
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_attachedDiskForceAttach(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_attachedDiskForceAttach(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.attached_disk", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.attached_disk", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.attached_disk", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.attached_disk", func(instance *compute.Instance) error {
+						var dataDisk *compute.AttachedDisk
+						for _, d := range instance.Disks {
+							if d != nil && d.DeviceName == "data-disk" {
+								dataDisk = d
+								break
+							}
+						}
+						if dataDisk == nil {
+							return fmt.Errorf("expected attached disk device_name data-disk on instance, got %#v", instance.Disks)
+						}
+						// force_attach is input-only in the API and may be omitted on instances.get.
+						if dataDisk.Mode != "READ_ONLY" {
+							return fmt.Errorf("expected READ_ONLY attached disk, got %q", dataDisk.Mode)
+						}
+						return nil
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_bootDiskInitializeParamsSnapshot(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_bootDiskInitializeParamsSnapshot(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.from_snapshot", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.from_snapshot", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.from_snapshot", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.from_snapshot", func(instance *compute.Instance) error {
+						var boot *compute.AttachedDisk
+						for _, d := range instance.Disks {
+							if d != nil && d.Boot {
+								boot = d
+								break
+							}
+						}
+						if boot == nil || boot.Source == "" {
+							return fmt.Errorf("expected boot disk with non-empty source (snapshot-backed), got %#v", boot)
+						}
+						return nil
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_guestAccelerator(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_guestAccelerator(context),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.gpu", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.gpu", func(instance *compute.Instance) error {
+						if len(instance.GuestAccelerators) != 1 {
+							return fmt.Errorf("expected 1 guest accelerator, got %#v", instance.GuestAccelerators)
+						}
+						if instance.GuestAccelerators[0].AcceleratorCount != int64(1) {
+							return fmt.Errorf("expected accelerator count 1, got %d", instance.GuestAccelerators[0].AcceleratorCount)
+						}
+						if !strings.Contains(instance.GuestAccelerators[0].AcceleratorType, "nvidia-tesla-t4") {
+							return fmt.Errorf("expected nvidia-tesla-t4 accelerator type, got %q", instance.GuestAccelerators[0].AcceleratorType)
+						}
+						return nil
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_confidentialInstance(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_confidentialInstance(context),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.confidential", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.confidential", func(instance *compute.Instance) error {
+						if instance.ConfidentialInstanceConfig == nil || !instance.ConfidentialInstanceConfig.EnableConfidentialCompute {
+							return fmt.Errorf("expected confidential compute enabled, got %#v", instance.ConfidentialInstanceConfig)
+						}
+						return nil
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_resourcePolicies(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_resourcePolicies(context),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.with_policy", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.with_policy", func(instance *compute.Instance) error {
+						return bulkRunInstanceCheck(instance, testAccCheckComputeResourcePolicy(instance, fmt.Sprintf("tf-test-bulk-rpol-%s", context["random_suffix"]), 1))
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_reservationAffinityNoReservation(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_reservationAffinityNoReservation(context),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.no_reservation", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.no_reservation", func(instance *compute.Instance) error {
+						if instance.ReservationAffinity == nil {
+							return fmt.Errorf("expected reservation_affinity on instance")
+						}
+						if instance.ReservationAffinity.ConsumeReservationType != "NO_RESERVATION" {
+							return fmt.Errorf("expected NO_RESERVATION, got %q", instance.ReservationAffinity.ConsumeReservationType)
+						}
+						return nil
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_invalidStandardTerminationAction(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccComputeBulkInstance_invalidStandardTerminationAction(context),
+				ExpectError: regexp.MustCompile(`instance_termination_action can only be used`),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_networkIpRejected(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccComputeBulkInstance_networkIpRejected(context),
+				ExpectError: regexp.MustCompile(`Custom internal IP addresses are not supported during bulk insertion`),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_natIpRejected(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccComputeBulkInstance_natIpRejected(context),
+				ExpectError: regexp.MustCompile(`Custom external IP addresses are not supported during bulk insertion`),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_bootDiskSourceRequiresRegionalDisk(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccComputeBulkInstance_bootDiskSourceRequiresRegionalDisk(context),
+				ExpectError: regexp.MustCompile(`Disk must be in a regional scope`),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_regionalBootDiskSource(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_regionalBootDiskSource(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.regional_boot_disk", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.regional_boot_disk", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.regional_boot_disk", 1),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_requestId(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+		"request_id":    uuid.New().String(),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config:             testAccComputeBulkInstance_requestId(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.request_id", "request_id", context["request_id"].(string)),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.request_id", "current_instance_count", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.request_id", 1),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_locationPolicyZonalUnsupported(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccComputeBulkInstance_locationPolicy(context),
+				ExpectError: regexp.MustCompile("location_policy is not supported on zonal instances.bulkInsert"),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_instanceFlexibilityPolicyZonalUnsupported(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccComputeBulkInstance_instanceFlexibilityPolicy(context),
+				ExpectError: regexp.MustCompile("instance_flexibility_policy is not supported on zonal instances.bulkInsert"),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_privateIpv6GoogleAccess(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config:             testAccComputeBulkInstance_privateIpv6GoogleAccess(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.p6", "current_instance_count", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.p6", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.p6", func(instance *compute.Instance) error {
+						v := instance.PrivateIpv6GoogleAccess
+						if v != "DISABLE" && v != "" {
+							return fmt.Errorf("expected private_ipv6_google_access DISABLE or empty on API instance, got %q", v)
+						}
+						return nil
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_schedulingLocationHintUnsupported(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+		"location_hint": fmt.Sprintf("tf-bulk-hint-%s", acctest.RandString(t, 8)),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccComputeBulkInstance_schedulingLocationHint(context),
+				ExpectError: regexp.MustCompile("scheduling.location_hint is not supported on instances.bulkInsert"),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_workloadIdentityUnsupported(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+		"wid_identity":  "//iam.googleapis.com/locations/global/workloadIdentityPools/tf-acc-pool/providers/tf-acc-provider",
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccComputeBulkInstance_workloadIdentityConfig(context),
+				ExpectError: regexp.MustCompile("workload_identity_config is not supported on instances.bulkInsert"),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_perInstanceHostname(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+		"project":       envvar.GetTestProjectFromEnv(),
+	}
+
+	wantHostname := fmt.Sprintf("tf-bulk-host-%s.c.%s.internal", context["random_suffix"], context["project"])
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config:             testAccComputeBulkInstance_perInstanceHostname(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.hosted", "current_instance_count", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.hosted", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.hosted", func(instance *compute.Instance) error {
+						if instance.Hostname != wantHostname {
+							return fmt.Errorf("expected hostname %q, got %q", wantHostname, instance.Hostname)
+						}
+						return nil
+					}),
+				),
+			},
+		},
+	})
+}
+
+func TestAccComputeBulkInstance_networkAttachmentSecondNic(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config:             testAccComputeBulkInstance_networkAttachmentSecondNic(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.net_att", "current_instance_count", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.net_att", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.net_att", func(instance *compute.Instance) error {
+						if len(instance.NetworkInterfaces) < 2 {
+							return fmt.Errorf("expected 2 network interfaces, got %d", len(instance.NetworkInterfaces))
+						}
+						var found bool
+						for _, ni := range instance.NetworkInterfaces {
+							if ni != nil && ni.NetworkAttachment != "" {
+								found = true
+								break
+							}
+						}
+						if !found {
+							return fmt.Errorf("expected a network_interface with network_attachment set on the created instance")
+						}
+						return nil
+					}),
+				),
+			},
+		},
+	})
+}
+
+{{- if ne $.TargetVersionName "ga" }}
+func TestAccComputeBulkInstance_betaSchedulingFields(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"random_suffix": acctest.RandString(t, 10),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderBetaFactories(t),
+		CheckDestroy:             testAccCheckComputeBulkInstanceDestroyProducer(t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccComputeBulkInstance_betaSchedulingFields(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.beta", "current_instance_count", "1"),
+					resource.TestCheckResourceAttr("google_compute_bulk_instance.beta", "instance_names.#", "1"),
+					testAccCheckComputeBulkInstanceExists(t, "google_compute_bulk_instance.beta", 1),
+					testAccCheckComputeBulkInstanceFirstInstance(t, "google_compute_bulk_instance.beta", func(instance *compute.Instance) error {
+						if instance.Scheduling == nil {
+							return fmt.Errorf("expected scheduling on instance")
+						}
+						if instance.Scheduling.HostErrorTimeoutSeconds != 120 {
+							return fmt.Errorf("expected HostErrorTimeoutSeconds 120, got %d", instance.Scheduling.HostErrorTimeoutSeconds)
+						}
+						if !instance.Scheduling.SkipGuestOsShutdown {
+							return fmt.Errorf("expected SkipGuestOsShutdown true, got %#v", instance.Scheduling)
+						}
+						return nil
+					}),
+				),
+			},
+		},
+	})
+}
+{{- end }}
+
+func bulkRunInstanceCheck(instance *compute.Instance, check resource.TestCheckFunc) error {
+	if check == nil {
+		return nil
+	}
+	return check(nil)
+}
+
+func testAccCheckComputeBulkInstanceFullInstanceAPI(instance *compute.Instance) error {
+	if instance == nil {
+		return fmt.Errorf("instance is nil")
+	}
+	for _, chk := range []resource.TestCheckFunc{
+		testAccCheckComputeInstanceTag(instance, "bulk"),
+		testAccCheckComputeInstanceTag(instance, "acctest"),
+		testAccCheckComputeInstanceLabel(instance, "environment", "test"),
+		testAccCheckComputeInstanceLabel(instance, "suite", "bulk"),
+		testAccCheckComputeInstanceMetadata(instance, "foo", "bar"),
+		testAccCheckComputeInstanceAccessConfigHasNatIP(instance),
+	} {
+		if err := bulkRunInstanceCheck(instance, chk); err != nil {
+			return err
+		}
+	}
+	if err := testAccCheckComputeBulkInstanceHasMachineType("n2-standard-2")(instance); err != nil {
+		return err
+	}
+	if !instance.CanIpForward {
+		return fmt.Errorf("expected CanIpForward true")
+	}
+	if instance.Description != "Acceptance test coverage for bulk instances" {
+		return fmt.Errorf("description: got %q", instance.Description)
+	}
+	if !strings.Contains(instance.MinCpuPlatform, "Cascade") {
+		return fmt.Errorf("MinCpuPlatform: expected Intel Cascade Lake family, got %q", instance.MinCpuPlatform)
+	}
+	if instance.ShieldedInstanceConfig == nil || !instance.ShieldedInstanceConfig.EnableVtpm ||
+		instance.ShieldedInstanceConfig.EnableSecureBoot || !instance.ShieldedInstanceConfig.EnableIntegrityMonitoring {
+		return fmt.Errorf("ShieldedInstanceConfig: %#v", instance.ShieldedInstanceConfig)
+	}
+	if instance.AdvancedMachineFeatures == nil || !instance.AdvancedMachineFeatures.EnableNestedVirtualization ||
+		instance.AdvancedMachineFeatures.ThreadsPerCore != 1 {
+		return fmt.Errorf("AdvancedMachineFeatures: %#v", instance.AdvancedMachineFeatures)
+	}
+	if instance.NetworkPerformanceConfig == nil || instance.NetworkPerformanceConfig.TotalEgressBandwidthTier != "DEFAULT" {
+		return fmt.Errorf("NetworkPerformanceConfig: %#v", instance.NetworkPerformanceConfig)
+	}
+	if len(instance.NetworkInterfaces) < 1 || instance.NetworkInterfaces[0].NicType != "GVNIC" {
+		return fmt.Errorf("expected GVNIC on first NIC, got %#v", instance.NetworkInterfaces)
+	}
+	if instance.ReservationAffinity == nil || instance.ReservationAffinity.ConsumeReservationType != "NO_RESERVATION" {
+		return fmt.Errorf("ReservationAffinity: %#v", instance.ReservationAffinity)
+	}
+	if instance.KeyRevocationActionType != "NONE" {
+		return fmt.Errorf("KeyRevocationActionType: want NONE, got %q", instance.KeyRevocationActionType)
+	}
+	return nil
+}
+
+func testAccCheckComputeBulkInstanceExists(t *testing.T, name string, wantCount int) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[name]
+		if !ok {
+			return fmt.Errorf("not found: %s", name)
+		}
+
+		if rs.Primary.ID == "" {
+			return fmt.Errorf("no ID is set for %s", name)
+		}
+
+		instances, err := testAccListComputeBulkInstances(t, rs.Primary.Attributes["project"], rs.Primary.Attributes["zone"], rs.Primary.Attributes["name_pattern"], testAccComputeBulkInstanceStateNames(rs.Primary.Attributes))
+		if err != nil {
+			return err
+		}
+
+		if len(instances) != wantCount {
+			names := make([]string, 0, len(instances))
+			for _, instance := range instances {
+				names = append(names, instance.Name)
+			}
+			return fmt.Errorf("expected %d instances for %s, got %d: %v", wantCount, name, len(instances), names)
+		}
+
+		return nil
+	}
+}
+
+func testAccCheckComputeBulkInstanceFirstInstance(t *testing.T, name string, check func(*compute.Instance) error) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[name]
+		if !ok {
+			return fmt.Errorf("not found: %s", name)
+		}
+
+		instances, err := testAccListComputeBulkInstances(t, rs.Primary.Attributes["project"], rs.Primary.Attributes["zone"], rs.Primary.Attributes["name_pattern"], testAccComputeBulkInstanceStateNames(rs.Primary.Attributes))
+		if err != nil {
+			return err
+		}
+		if len(instances) == 0 {
+			return fmt.Errorf("no instances found for %s", name)
+		}
+
+		return check(instances[0])
+	}
+}
+
+func testAccCheckComputeBulkInstanceHasMachineType(want string) func(*compute.Instance) error {
+	return func(instance *compute.Instance) error {
+		if instance == nil {
+			return fmt.Errorf("instance is nil")
+		}
+		got := path.Base(instance.MachineType)
+		if got != want {
+			return fmt.Errorf("machineType want %q, got %q (full %q)", want, got, instance.MachineType)
+		}
+		return nil
+	}
+}
+
+func testAccCheckComputeBulkInstanceHasName(want string) func(*compute.Instance) error {
+	return func(instance *compute.Instance) error {
+		if instance == nil {
+			return fmt.Errorf("instance is nil")
+		}
+		if instance.Name != want {
+			return fmt.Errorf("instance name want %q, got %q", want, instance.Name)
+		}
+		return nil
+	}
+}
+
+func testAccCheckComputeBulkInstanceDestroyProducer(t *testing.T) func(s *terraform.State) error {
+	return func(s *terraform.State) error {
+		for _, rs := range s.RootModule().Resources {
+			if rs.Type != "google_compute_bulk_instance" {
+				continue
+			}
+
+			instances, err := testAccListComputeBulkInstances(t, rs.Primary.Attributes["project"], rs.Primary.Attributes["zone"], rs.Primary.Attributes["name_pattern"], testAccComputeBulkInstanceStateNames(rs.Primary.Attributes))
+			if err != nil {
+				return err
+			}
+
+			if len(instances) == 0 {
+				continue
+			}
+
+			names := make([]string, 0, len(instances))
+			for _, instance := range instances {
+				names = append(names, instance.Name)
+			}
+
+			return fmt.Errorf("tracked bulk instances still exist: %s", strings.Join(names, ", "))
+		}
+
+		return nil
+	}
+}
+
+func testAccComputeBulkInstanceStateNames(attrs map[string]string) []string {
+	count := 0
+	if rawCount, ok := attrs["instance_names.#"]; ok {
+		fmt.Sscanf(rawCount, "%d", &count)
+	}
+
+	names := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		if name, ok := attrs[fmt.Sprintf("instance_names.%d", i)]; ok && name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func testAccListComputeBulkInstances(t *testing.T, project, zone, namePattern string, explicitNames []string) ([]*compute.Instance, error) {
+	config := acctest.GoogleProviderConfig(t)
+	if project == "" {
+		project = envvar.GetTestProjectFromEnv()
+	}
+
+	var nameRe *regexp.Regexp
+	var err error
+	if namePattern != "" {
+		nameRe, err = testAccComputeBulkInstanceNameRegexp(namePattern)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	explicitNameSet := make(map[string]struct{}, len(explicitNames))
+	for _, name := range explicitNames {
+		if name != "" {
+			explicitNameSet[name] = struct{}{}
+		}
+	}
+
+	instances := make([]*compute.Instance, 0)
+	seen := make(map[string]struct{})
+	req := config.NewComputeClient(config.UserAgent).Instances.List(project, zone)
+	err = req.Pages(context.Background(), func(page *compute.InstanceList) error {
+		for _, instance := range page.Items {
+			if instance == nil {
+				continue
+			}
+			if nameRe != nil && nameRe.MatchString(instance.Name) {
+				if _, ok := seen[instance.Name]; !ok {
+					instances = append(instances, instance)
+					seen[instance.Name] = struct{}{}
+				}
+				continue
+			}
+			if _, ok := explicitNameSet[instance.Name]; ok {
+				if _, ok := seen[instance.Name]; !ok {
+					instances = append(instances, instance)
+					seen[instance.Name] = struct{}{}
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return instances, nil
+}
+
+func testAccComputeBulkInstanceNameRegexp(namePattern string) (*regexp.Regexp, error) {
+	var builder strings.Builder
+	builder.WriteString("^")
+
+	for i := 0; i < len(namePattern); {
+		if namePattern[i] == '#' {
+			j := i
+			for j < len(namePattern) && namePattern[j] == '#' {
+				j++
+			}
+			builder.WriteString(fmt.Sprintf(`[0-9]{%d}`, j-i))
+			i = j
+			continue
+		}
+
+		builder.WriteString(regexp.QuoteMeta(string(namePattern[i])))
+		i++
+	}
+
+	builder.WriteString("$")
+	return regexp.Compile(builder.String())
+}
+
+func testAccComputeBulkInstance_basic(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.10.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "basic" {
+  name_pattern   = "tf-test-bulk-basic-%{random_suffix}-####"
+  instance_count = 1
+  min_count      = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_multipleInstances(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.11.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "multiple" {
+  name_pattern   = "tf-test-bulk-multi-%{random_suffix}-####"
+  instance_count = 2
+  zone           = "us-central1-a"
+  machine_type   = "e2-micro"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_perInstanceProperties(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.12.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "named" {
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  per_instance_properties = {
+    "tf-test-bulk-named-%{random_suffix}" = ""
+  }
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_minCount(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.12.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "min_count" {
+  name_pattern   = "tf-test-bulk-min-%{random_suffix}-####"
+  instance_count = 2
+  min_count      = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-micro"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_metadataStartupScript(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.13.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "startup_script" {
+  name_pattern            = "tf-test-bulk-startup-%{random_suffix}-####"
+  instance_count          = 1
+  zone                    = "us-central1-a"
+  machine_type            = "e2-micro"
+  metadata_startup_script = "echo bulk-startup"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_serviceAccount(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.14.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_service_account" "bulk" {
+  account_id   = "tf-bulk-sa-%{random_suffix}"
+  display_name = "Bulk Instance Acceptance SA"
+}
+
+resource "google_compute_bulk_instance" "with_service_account" {
+  name_pattern   = "tf-test-bulk-sa-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-micro"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+  service_account {
+    email = google_service_account.bulk.email
+    scopes = [
+      "userinfo-email",
+      "compute-ro",
+    ]
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_resourceManagerTags(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_tags_tag_key" "key" {
+  parent      = "projects/%{project}"
+  short_name  = "bulkkey%{random_suffix}"
+  description = "Bulk tag key"
+}
+
+resource "google_tags_tag_value" "value" {
+  parent      = google_tags_tag_key.key.id
+  short_name  = "bulkvalue%{random_suffix}"
+  description = "Bulk tag value"
+}
+
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.15.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "resource_manager_tags" {
+  name_pattern   = "tf-test-bulk-tags-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-micro"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+  params {
+    resource_manager_tags = {
+      (google_tags_tag_key.key.id) = google_tags_tag_value.value.id
+    }
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_reservationAffinitySpecificMissing(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.16.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "invalid_reservation" {
+  name_pattern   = "tf-test-bulk-reservation-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-micro"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+  reservation_affinity {
+    type = "SPECIFIC_RESERVATION"
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_full(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.20.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "full" {
+  name_pattern               = "tf-test-bulk-full-%{random_suffix}-####"
+  instance_count             = 1
+  min_count                  = 1
+  zone                       = "us-central1-a"
+  allow_stopping_for_update  = true
+  can_ip_forward             = true
+  deletion_protection        = false
+  description                = "Acceptance test coverage for bulk instances"
+  enable_display             = false
+  key_revocation_action_type = "NONE"
+  machine_type               = "n2-standard-2"
+  min_cpu_platform           = "Intel Cascade Lake"
+
+  labels = {
+    environment = "test"
+    suite       = "bulk"
+  }
+
+  metadata = {
+    foo = "bar"
+  }
+
+  tags = ["bulk", "acctest"]
+
+  boot_disk {
+    auto_delete  = true
+    device_name  = "boot-disk"
+    force_attach = false
+    guest_os_features = [
+      "GVNIC",
+      "UEFI_COMPATIBLE",
+    ]
+    interface = "SCSI"
+    mode      = "READ_WRITE"
+
+    initialize_params {
+      architecture                = "X86_64"
+      enable_confidential_compute = false
+      image                       = "projects/debian-cloud/global/images/family/debian-11"
+      size                        = 20
+      type                        = "pd-balanced"
+      labels = {
+        boot = "bulk"
+      }
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+    nic_type   = "GVNIC"
+    stack_type = "IPV4_ONLY"
+
+    access_config {
+      network_tier = "PREMIUM"
+    }
+  }
+
+  network_performance_config {
+    total_egress_bandwidth_tier = "DEFAULT"
+  }
+
+  reservation_affinity {
+    type = "NO_RESERVATION"
+  }
+
+  advanced_machine_features {
+    enable_nested_virtualization = true
+    enable_uefi_networking       = false
+    threads_per_core             = 1
+  }
+
+  shielded_instance_config {
+    enable_integrity_monitoring = true
+    enable_secure_boot          = false
+    enable_vtpm                 = true
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_sourceInstanceTemplate(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.30.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_instance_template" "bulk" {
+  name_prefix  = "tf-test-bulk-template-%{random_suffix}-"
+  machine_type = "e2-medium"
+  description  = "Template source for bulk instance acceptance testing"
+  tags         = ["bulk-template"]
+
+  disk {
+    source_image = "projects/debian-cloud/global/images/family/debian-11"
+    auto_delete  = true
+    boot         = true
+    disk_size_gb = 10
+    disk_type    = "pd-balanced"
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+}
+
+resource "google_compute_bulk_instance" "template" {
+  name_pattern             = "tf-test-bulk-template-%{random_suffix}-####"
+  instance_count           = 1
+  zone                     = "us-central1-a"
+  source_instance_template = google_compute_instance_template.bulk.self_link
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_sourceInstanceTemplateOverrides(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.31.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_instance_template" "bulk" {
+  name_prefix  = "tf-test-bulk-template-override-%{random_suffix}-"
+  machine_type = "e2-medium"
+  description  = "Template source description"
+  tags         = ["bulk-template"]
+
+  metadata = {
+    source = "template"
+  }
+
+  disk {
+    source_image = "projects/debian-cloud/global/images/family/debian-11"
+    auto_delete  = true
+    boot         = true
+    disk_size_gb = 10
+    disk_type    = "pd-balanced"
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+
+resource "google_compute_bulk_instance" "template_override" {
+  name_pattern             = "tf-test-bulk-template-override-%{random_suffix}-####"
+  instance_count           = 1
+  zone                     = "us-central1-a"
+  source_instance_template = google_compute_instance_template.bulk.self_link
+  machine_type             = "e2-small"
+  description              = "Bulk override description"
+  tags                     = ["bulk-override"]
+
+  labels = {
+    bulk_override_label = "yes"
+  }
+
+  metadata = {
+    source = "bulk-override"
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_advancedMachineFeaturesExpanded(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.32.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "advanced_machine_features" {
+  name_pattern   = "tf-test-bulk-amf-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "c4-standard-2"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-12"
+      size  = 10
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+  advanced_machine_features {
+    enable_nested_virtualization = true
+    threads_per_core             = 1
+    turbo_mode                   = "ALL_CORE_MAX"
+    visible_core_count           = 1
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_spot(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.40.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "spot" {
+  name_pattern   = "tf-test-bulk-spot-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+  scheduling {
+    automatic_restart          = false
+    instance_termination_action = "STOP"
+    on_host_maintenance        = "TERMINATE"
+    preemptible                = true
+    provisioning_model         = "SPOT"
+
+    max_run_duration {
+      seconds = 3600
+    }
+  }
+
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_extendedSpotScheduling(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.41.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "extended_spot" {
+  name_pattern   = "tf-test-bulk-spotx-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+  scheduling {
+    automatic_restart           = false
+    instance_termination_action = "STOP"
+    on_host_maintenance         = "TERMINATE"
+    preemptible                 = true
+    provisioning_model          = "SPOT"
+
+    max_run_duration {
+      seconds = 180
+      nanos   = 123
+    }
+
+    on_instance_stop_action {
+      discard_local_ssd = true
+    }
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_scratchDisk(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.50.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "scratch" {
+  name_pattern   = "tf-test-bulk-scratch-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "n2-standard-2"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+  scratch_disk {
+    device_name = "local-ssd-0"
+    interface   = "NVME"
+    size        = 375
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_localSsdRecoveryTimeout(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.51.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "local_ssd_recovery" {
+  name_pattern   = "tf-test-bulk-ssdr-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "n2-standard-2"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+  scratch_disk {
+    device_name = "local-ssd-0"
+    interface   = "NVME"
+    size        = 375
+  }
+
+  scheduling {
+    local_ssd_recovery_timeout {
+      seconds = 3600
+      nanos   = 0
+    }
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_attachedDiskForceAttach(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.52.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_disk" "seed" {
+  name  = "tf-test-bulk-data-seed-%{random_suffix}"
+  image = "projects/debian-cloud/global/images/family/debian-11"
+  size  = 20
+  type  = "pd-ssd"
+  zone  = "us-central1-a"
+}
+
+resource "google_compute_snapshot" "data" {
+  name        = "tf-test-bulk-data-snap-%{random_suffix}"
+  source_disk = google_compute_disk.seed.name
+  zone        = "us-central1-a"
+}
+
+resource "google_compute_region_disk" "data" {
+  name          = "tf-test-bulk-data-%{random_suffix}"
+  snapshot      = google_compute_snapshot.data.self_link
+  type          = "pd-ssd"
+  replica_zones = ["us-central1-a", "us-central1-f"]
+}
+
+resource "google_compute_bulk_instance" "attached_disk" {
+  name_pattern   = "tf-test-bulk-adisk-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-balanced"
+    }
+  }
+
+  attached_disk {
+    device_name  = "data-disk"
+    force_attach = true
+    mode         = "READ_ONLY"
+    source       = google_compute_region_disk.data.self_link
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_bootDiskInitializeParamsSnapshot(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.60.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_disk" "snap_seed" {
+  name  = "tf-test-bulk-snap-seed-%{random_suffix}"
+  image = "projects/debian-cloud/global/images/family/debian-11"
+  size  = 10
+  type  = "pd-standard"
+  zone  = "us-central1-a"
+}
+
+resource "google_compute_snapshot" "boot" {
+  name        = "tf-test-bulk-bootsnap-%{random_suffix}"
+  source_disk = google_compute_disk.snap_seed.id
+}
+
+resource "google_compute_bulk_instance" "from_snapshot" {
+  name_pattern   = "tf-test-bulk-snapinst-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      snapshot = google_compute_snapshot.boot.self_link
+      size     = 10
+      type     = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_guestAccelerator(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.61.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "gpu" {
+  name_pattern   = "tf-test-bulk-gpu-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "n1-standard-1"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+  scheduling {
+    on_host_maintenance = "TERMINATE"
+  }
+
+  guest_accelerator {
+    count = 1
+    type  = "nvidia-tesla-t4"
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_confidentialInstance(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.62.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "confidential" {
+  name_pattern   = "tf-test-bulk-conf-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "n2d-standard-2"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts"
+      size  = 10
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+  confidential_instance_config {
+    enable_confidential_compute = true
+  }
+
+  scheduling {
+    on_host_maintenance = "TERMINATE"
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_resourcePolicies(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.63.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_resource_policy" "instance_schedule" {
+  name   = "tf-test-bulk-rpol-%{random_suffix}"
+  region = "us-central1"
+  instance_schedule_policy {
+    vm_start_schedule {
+      schedule = "1 1 1 1 1"
+    }
+    vm_stop_schedule {
+      schedule = "2 2 2 2 2"
+    }
+    time_zone = "UTC"
+  }
+}
+
+resource "google_compute_bulk_instance" "with_policy" {
+  name_pattern   = "tf-test-bulk-rpoli-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+  resource_policies = [google_compute_resource_policy.instance_schedule.id]
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_reservationAffinityNoReservation(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.64.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "no_reservation" {
+  name_pattern   = "tf-test-bulk-resv-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+  reservation_affinity {
+    type = "NO_RESERVATION"
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_invalidStandardTerminationAction(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.70.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "invalid" {
+  name_pattern   = "tf-test-bulk-term-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+  scheduling {
+    instance_termination_action = "STOP"
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_networkIpRejected(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.80.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "invalid" {
+  name_pattern   = "tf-test-bulk-netip-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+    network_ip = "10.80.0.10"
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_natIpRejected(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.81.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_address" "bulk" {
+  name   = "tf-test-bulk-extip-%{random_suffix}"
+  region = "us-central1"
+}
+
+resource "google_compute_bulk_instance" "invalid" {
+  name_pattern   = "tf-test-bulk-natip-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+
+    access_config {
+      nat_ip = google_compute_address.bulk.address
+    }
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_bootDiskSourceRequiresRegionalDisk(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.90.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_disk" "boot" {
+  name  = "tf-test-bulk-boot-%{random_suffix}"
+  zone  = "us-central1-a"
+  size  = 20
+  type  = "pd-balanced"
+  image = "projects/debian-cloud/global/images/family/debian-11"
+}
+
+resource "google_compute_bulk_instance" "invalid" {
+  name_pattern   = "tf-test-bulk-boot-src-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  boot_disk {
+    auto_delete = false
+    mode        = "READ_WRITE"
+    source      = google_compute_disk.boot.self_link
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_regionalBootDiskSource(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.91.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_disk" "seed" {
+  name  = "tf-test-bulk-seed-%{random_suffix}"
+  image = "projects/debian-cloud/global/images/family/debian-11"
+  size  = 20
+  type  = "pd-ssd"
+  zone  = "us-central1-a"
+}
+
+resource "google_compute_snapshot" "seed" {
+  name        = "tf-test-bulk-snap-%{random_suffix}"
+  source_disk = google_compute_disk.seed.name
+  zone        = "us-central1-a"
+}
+
+resource "google_compute_region_disk" "boot" {
+  name          = "tf-test-bulk-rdisk-%{random_suffix}"
+  snapshot      = google_compute_snapshot.seed.self_link
+  type          = "pd-ssd"
+  replica_zones = ["us-central1-a", "us-central1-f"]
+}
+
+resource "google_compute_bulk_instance" "regional_boot_disk" {
+  name_pattern   = "tf-test-bulk-rboot-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  boot_disk {
+    auto_delete = false
+    mode        = "READ_WRITE"
+    source      = google_compute_region_disk.boot.self_link
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_requestId(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.44.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "request_id" {
+  name_pattern   = "tf-test-bulk-reqid-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+  request_id     = "%{request_id}"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_locationPolicy(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.45.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "location_policy" {
+  name_pattern   = "tf-test-bulk-lpol-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  location_policy {
+    target_shape = "ANY_SINGLE_ZONE"
+
+    zones {
+      zone = "zones/us-central1-a"
+    }
+
+    location {
+      zone        = "zones/us-central1-a"
+      preference  = "ALLOW"
+      max_count   = 8
+    }
+  }
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_instanceFlexibilityPolicy(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.46.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "flex" {
+  name_pattern   = "tf-test-bulk-flex-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  instance_flexibility_policy {
+    instance_selection {
+      name          = "primary"
+      machine_types = ["e2-medium", "e2-small"]
+      rank          = 1
+    }
+  }
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_privateIpv6GoogleAccess(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.47.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "p6" {
+  name_pattern   = "tf-test-bulk-p6-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  private_ipv6_google_access = "DISABLE"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_schedulingLocationHint(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.52.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "p6_hint" {
+  name_pattern   = "tf-test-bulk-p6hint-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+  scheduling {
+    on_host_maintenance = "MIGRATE"
+    automatic_restart   = true
+    location_hint       = "%{location_hint}"
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_workloadIdentityConfig(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.48.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "wid" {
+  name_pattern   = "tf-test-bulk-wid-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  workload_identity_config {
+    identity                     = "%{wid_identity}"
+    identity_certificate_enabled = true
+  }
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_perInstanceHostname(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.49.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "hosted" {
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  per_instance_properties = {
+    "tf-test-bulk-hnamed-%{random_suffix}" = "tf-bulk-host-%{random_suffix}.c.%{project}.internal"
+  }
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+}
+`, context)
+}
+
+func testAccComputeBulkInstance_networkAttachmentSecondNic(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.50.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_network_attachment" "att" {
+  name                  = "tf-test-bulk-natt-%{random_suffix}"
+  region                = "us-central1"
+  connection_preference = "ACCEPT_AUTOMATIC"
+
+  subnetworks = [
+    google_compute_subnetwork.bulk.self_link
+  ]
+}
+
+resource "google_compute_bulk_instance" "net_att" {
+  name_pattern   = "tf-test-bulk-nattm-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    network = "default"
+  }
+
+  network_interface {
+    network_attachment = google_compute_network_attachment.att.self_link
+  }
+}
+`, context)
+}
+
+{{- if ne $.TargetVersionName "ga" }}
+func testAccComputeBulkInstance_betaSchedulingFields(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_compute_network" "bulk" {
+  provider                = google-beta
+  name                    = "tf-test-bulk-net-%{random_suffix}"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "bulk" {
+  provider      = google-beta
+  name          = "tf-test-bulk-subnet-%{random_suffix}"
+  ip_cidr_range = "10.100.0.0/24"
+  region        = "us-central1"
+  network       = google_compute_network.bulk.id
+}
+
+resource "google_compute_bulk_instance" "beta" {
+  provider       = google-beta
+  name_pattern   = "tf-test-bulk-beta-%{random_suffix}-####"
+  instance_count = 1
+  zone           = "us-central1-a"
+  machine_type   = "e2-medium"
+
+  boot_disk {
+    auto_delete = true
+    mode        = "READ_WRITE"
+
+    initialize_params {
+      image = "projects/debian-cloud/global/images/family/debian-11"
+      size  = 10
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bulk.id
+  }
+
+  scheduling {
+    host_error_timeout_seconds = 120
+    skip_guest_os_shutdown     = true
+  }
+
+}
+`, context)
+}
+{{- end }}

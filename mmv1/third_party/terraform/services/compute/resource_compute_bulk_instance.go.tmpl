@@ -1,0 +1,1651 @@
+package compute
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	neturl "net/url"
+	"regexp"
+	"sort"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/customdiff"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+
+	"github.com/hashicorp/terraform-provider-google/google/tpgresource"
+	transport_tpg "github.com/hashicorp/terraform-provider-google/google/transport"
+	"google.golang.org/api/googleapi"
+
+{{ if eq $.TargetVersionName `ga` }}
+	"google.golang.org/api/compute/v1"
+{{- else }}
+	compute "google.golang.org/api/compute/v0.beta"
+{{- end }}
+)
+
+var bulkInstanceNamePatternRe = regexp.MustCompile(`^[^#]*#+[^#]*$`)
+var bulkInstanceHashPlaceholderRe = regexp.MustCompile(`#+`)
+
+func ResourceComputeBulkInstance() *schema.Resource {
+	return &schema.Resource{
+		Create: resourceComputeBulkInstanceCreate,
+		Read:   resourceComputeBulkInstanceRead,
+		Delete: resourceComputeBulkInstanceDelete,
+
+		Timeouts: ResourceComputeInstance().Timeouts,
+
+		Schema:        computeBulkInstanceSchema(),
+		CustomizeDiff: customdiff.All(
+			tpgresource.DefaultProviderProject,
+			tpgresource.DefaultProviderZone,
+			resourceComputeBulkInstanceCustomizeDiff,
+			tpgresource.SetLabelsDiff,
+		),
+		UseJSONNumber: true,
+	}
+}
+
+func resourceComputeBulkInstanceCustomizeDiff(ctx context.Context, d *schema.ResourceDiff, meta interface{}) error {
+	namePattern := d.Get("name_pattern").(string)
+	perInstanceProperties := normalizeBulkInsertStringMap(d.Get("per_instance_properties"))
+	if namePattern == "" && len(perInstanceProperties) == 0 {
+		return fmt.Errorf("either name_pattern or per_instance_properties must be set")
+	}
+	// Zonal instances.bulkInsert rejects these even though they appear on the REST discovery shape.
+	if raw := d.Get("location_policy"); raw != nil {
+		if lp, ok := raw.([]interface{}); ok && len(lp) > 0 && lp[0] != nil {
+			return fmt.Errorf("location_policy is not supported on zonal instances.bulkInsert, which is the only API used by google_compute_bulk_instance (regional bulk insert only)")
+		}
+	}
+	if raw := d.Get("instance_flexibility_policy"); raw != nil {
+		if fp, ok := raw.([]interface{}); ok && len(fp) > 0 && fp[0] != nil {
+			return fmt.Errorf("instance_flexibility_policy is not supported on zonal instances.bulkInsert, which is the only API used by google_compute_bulk_instance")
+		}
+	}
+	if raw := d.Get("workload_identity_config"); raw != nil {
+		if wi, ok := raw.([]interface{}); ok && len(wi) > 0 && wi[0] != nil {
+			return fmt.Errorf("workload_identity_config is not supported on instances.bulkInsert")
+		}
+	}
+	if v, ok := d.GetOk("scheduling.0.location_hint"); ok && strings.TrimSpace(v.(string)) != "" {
+		return fmt.Errorf("scheduling.location_hint is not supported on instances.bulkInsert (reserved for internal use on public API calls)")
+	}
+	if v, ok := d.GetOk("scheduling.0.instance_termination_action"); ok && v.(string) != "" {
+		provisioningModel := d.Get("scheduling.0.provisioning_model").(string)
+		if provisioningModel == "" || provisioningModel == "STANDARD" {
+			return fmt.Errorf("instance_termination_action can only be used with Spot, Reservation-Bound or Flex Start provisioning models, not STANDARD. Either remove instance_termination_action or set provisioning_model to SPOT, SPOT_UNSPECIFIED, FLEX, or FLEX_START")
+		}
+	}
+	return nil
+}
+
+func validateComputeBulkInstanceNamePattern(v interface{}, k string) (ws []string, errors []error) {
+	pattern := v.(string)
+	if !bulkInstanceNamePatternRe.MatchString(pattern) {
+		errors = append(errors, fmt.Errorf("%q must contain exactly one continuous sequence of # characters, for example \"inst-####\"", k))
+		return
+	}
+
+	match := bulkInstanceHashPlaceholderRe.FindStringIndex(pattern)
+	if match == nil {
+		errors = append(errors, fmt.Errorf("%q must contain at least one # character", k))
+		return
+	}
+	if match[1]-match[0] > 18 {
+		errors = append(errors, fmt.Errorf("%q can contain at most 18 consecutive # characters", k))
+	}
+	return
+}
+
+func validateBulkInsertRequestId(v interface{}, k string) (ws []string, es []error) {
+	s, ok := v.(string)
+	if !ok || s == "" {
+		return
+	}
+	if _, err := uuid.Parse(s); err != nil {
+		es = append(es, fmt.Errorf("%q must be a UUID (RFC 4122); the bulkInsert requestId query parameter rejects other formats: %v", k, err))
+	}
+	return
+}
+
+func cloneStringSlice(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneSchema(s *schema.Schema) *schema.Schema {
+	if s == nil {
+		return nil
+	}
+
+	cloned := *s
+	cloned.AtLeastOneOf = cloneStringSlice(s.AtLeastOneOf)
+	cloned.ConflictsWith = cloneStringSlice(s.ConflictsWith)
+	cloned.ExactlyOneOf = cloneStringSlice(s.ExactlyOneOf)
+	cloned.RequiredWith = cloneStringSlice(s.RequiredWith)
+
+	switch elem := s.Elem.(type) {
+	case *schema.Resource:
+		elemClone := *elem
+		elemClone.Schema = cloneSchemaMap(elem.Schema)
+		cloned.Elem = &elemClone
+	case *schema.Schema:
+		cloned.Elem = cloneSchema(elem)
+	default:
+		cloned.Elem = s.Elem
+	}
+
+	return &cloned
+}
+
+func cloneSchemaMap(in map[string]*schema.Schema) map[string]*schema.Schema {
+	out := make(map[string]*schema.Schema, len(in))
+	for k, v := range in {
+		out[k] = cloneSchema(v)
+	}
+	return out
+}
+
+func recurseOnSchemaForceNew(s map[string]*schema.Schema, f func(*schema.Schema)) {
+	for _, field := range s {
+		f(field)
+		if e := field.Elem; e != nil {
+			if r, ok := e.(*schema.Resource); ok {
+				recurseOnSchemaForceNew(r.Schema, f)
+			}
+		}
+	}
+}
+
+func deleteSchemaFieldPath(s map[string]*schema.Schema, parts ...string) {
+	if len(parts) == 0 {
+		return
+	}
+
+	if len(parts) == 1 {
+		delete(s, parts[0])
+		return
+	}
+
+	field, ok := s[parts[0]]
+	if !ok || field.Elem == nil {
+		return
+	}
+
+	child, ok := field.Elem.(*schema.Resource)
+	if !ok {
+		return
+	}
+
+	deleteSchemaFieldPath(child.Schema, parts[1:]...)
+}
+
+// filterSchemaConstraints removes references to excluded paths from AtLeastOneOf, ExactlyOneOf, etc.
+// so provider validation passes after we delete fields not in Bulkinsert.api.
+func filterSchemaConstraints(s map[string]*schema.Schema, excluded map[string]bool) {
+	filter := func(attr []string) []string {
+		if len(attr) == 0 {
+			return attr
+		}
+		filtered := make([]string, 0, len(attr))
+		for _, p := range attr {
+			if !excluded[p] {
+				filtered = append(filtered, p)
+			}
+		}
+		return filtered
+	}
+	for _, field := range s {
+		if field.AtLeastOneOf != nil {
+			if f := filter(field.AtLeastOneOf); len(f) < len(field.AtLeastOneOf) {
+				field.AtLeastOneOf = f
+			}
+		}
+		if field.ExactlyOneOf != nil {
+			if f := filter(field.ExactlyOneOf); len(f) < len(field.ExactlyOneOf) {
+				field.ExactlyOneOf = f
+			}
+		}
+		if field.RequiredWith != nil {
+			if f := filter(field.RequiredWith); len(f) < len(field.RequiredWith) {
+				field.RequiredWith = f
+			}
+		}
+		if field.ConflictsWith != nil {
+			if f := filter(field.ConflictsWith); len(f) < len(field.ConflictsWith) {
+				field.ConflictsWith = f
+			}
+		}
+		if e := field.Elem; e != nil {
+			if r, ok := e.(*schema.Resource); ok {
+				filterSchemaConstraints(r.Schema, excluded)
+			}
+		}
+	}
+}
+
+func computeBulkInstanceSchema() map[string]*schema.Schema {
+	s := cloneSchemaMap(ResourceComputeInstance().Schema)
+
+	recurseOnSchemaForceNew(s, func(field *schema.Schema) {
+		field.ForceNew = true
+	})
+
+	// Replace name with optional - expandComputeInstance needs it for internal use, we use name_pattern for bulk API
+	s["name"] = &schema.Schema{
+		Type:        schema.TypeString,
+		Optional:    true,
+		ForceNew:    true,
+		Description: `Not used for bulk instances - use name_pattern or per_instance_properties keys instead. Kept for schema compatibility with expandComputeInstance.`,
+	}
+
+	// bulkInsert API does not support deletion_protection or enable_display.
+	// Keep them in schema with defaults so expandComputeInstance does not panic; values are ignored.
+	s["deletion_protection"] = &schema.Schema{
+		Type:        schema.TypeBool,
+		Optional:    true,
+		ForceNew:    true,
+		Description: `Not supported by bulk insert - always false. Kept for schema compatibility with expandComputeInstance.`,
+	}
+	s["enable_display"] = &schema.Schema{
+		Type:        schema.TypeBool,
+		Optional:    true,
+		ForceNew:    true,
+		Description: `Not supported by bulk insert - always false. Kept for schema compatibility with expandComputeInstance.`,
+	}
+	delete(s, "display_device")
+	delete(s, "hostname")
+
+	// bulkInsert should not expose inherited instance output/state fields.
+	// Note: boot_disk.initialize_params.architecture is input (API), not output-only.
+	// Also remove beta-only fields not in Bulkinsert.api: mac_address, security_policy (network-level),
+	// partner_metadata, graceful_shutdown, maintenance_interval, preemption_notice_duration.
+	for _, fieldPath := range [][]string{
+		{"attached_disk", "disk_encryption_key_raw"},
+		{"attached_disk", "disk_encryption_key_rsa"},
+		{"attached_disk", "disk_encryption_key_sha256"},
+		{"boot_disk", "disk_encryption_key_raw"},
+		{"boot_disk", "disk_encryption_key_rsa"},
+		{"boot_disk", "disk_encryption_key_sha256"},
+		{"boot_disk", "initialize_params", "source_image_encryption_key", "raw_key"},
+		{"boot_disk", "initialize_params", "source_image_encryption_key", "rsa_encrypted_key"},
+		{"boot_disk", "initialize_params", "source_image_encryption_key", "sha256"},
+		{"network_interface", "ipv6_access_type"},
+		{"network_interface", "name"},
+		{"network_interface", "mac_address"},
+		{"network_interface", "security_policy"},
+		{"network_interface", "enable_vpc_scoped_dns"},
+		{"partner_metadata"},
+		{"scheduling", "graceful_shutdown"},
+		{"scheduling", "maintenance_interval"},
+		{"scheduling", "preemption_notice_duration"},
+		{"cpu_platform"},
+		{"creation_timestamp"},
+		{"current_status"},
+		{"desired_status"},
+		{"instance_encryption_key"},
+		{"instance_id"},
+		{"label_fingerprint"},
+		{"metadata_fingerprint"},
+		{"self_link"},
+		{"tags_fingerprint"},
+	} {
+		deleteSchemaFieldPath(s, fieldPath...)
+	}
+
+	filterSchemaConstraints(s, map[string]bool{
+		"boot_disk.0.disk_encryption_key_raw":                         true,
+		"boot_disk.0.disk_encryption_key_rsa":                         true,
+		"scheduling.0.maintenance_interval":                           true,
+		"scheduling.0.graceful_shutdown":                              true,
+		"scheduling.0.preemption_notice_duration": true,
+	})
+
+	// When source_instance_template is used, boot_disk/machine_type/network_interface are optional overrides
+	for _, field := range []string{"boot_disk", "machine_type", "network_interface"} {
+		if sch, ok := s[field]; ok {
+			sch.Required = false
+			sch.Optional = true
+		}
+	}
+
+	if schedulingSchema, ok := s["scheduling"]; ok && schedulingSchema.Elem != nil {
+		if schedulingResource, ok := schedulingSchema.Elem.(*schema.Resource); ok {
+			schedulingResource.Schema["location_hint"] = &schema.Schema{
+				Type:        schema.TypeString,
+				Optional:    true,
+				ForceNew:    true,
+				Description: `Not supported on instances.bulkInsert; if set, plan fails (reserved for internal use on public API calls).`,
+			}
+		}
+	}
+
+	s["private_ipv6_google_access"] = &schema.Schema{
+		Type:        schema.TypeString,
+		Optional:    true,
+		ForceNew:    true,
+		Description: `The private IPv6 Google access type for VMs.`,
+	}
+	s["workload_identity_config"] = &schema.Schema{
+		Type:        schema.TypeList,
+		Optional:    true,
+		ForceNew:    true,
+		MaxItems:    1,
+		Description: `Not supported on instances.bulkInsert; if set, plan fails. Use google_compute_instance if you need workload identity.`,
+		Elem: &schema.Resource{
+			Schema: map[string]*schema.Schema{
+				"identity": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					ForceNew:    true,
+					Description: `The workload identity attached to the instance.`,
+				},
+				"identity_certificate_enabled": {
+					Type:        schema.TypeBool,
+					Optional:    true,
+					ForceNew:    true,
+					Description: `Whether workload identity certificates are enabled.`,
+				},
+			},
+		},
+	}
+
+	s["name_pattern"] = &schema.Schema{
+		Type:        schema.TypeString,
+		Optional:    true,
+		ForceNew:    true,
+		ValidateFunc: validateComputeBulkInstanceNamePattern,
+		Description: `The string pattern used for the names of the VMs. The pattern must contain one continuous sequence of placeholder hash characters (#) with each character corresponding to one digit of the generated instance name. Example: "inst-####" generates instance names such as "inst-0001" and "inst-0002".`,
+	}
+	s["per_instance_properties"] = &schema.Schema{
+		Type:        schema.TypeMap,
+		Optional:    true,
+		ForceNew:    true,
+		Elem:        &schema.Schema{Type: schema.TypeString},
+		Description: `Per-instance properties keyed by explicit instance name. The map value sets the custom hostname for that instance; use an empty string to request a specific name without a custom hostname.`,
+	}
+	s["instance_count"] = &schema.Schema{
+		Type:        schema.TypeInt,
+		Required:    true,
+		ForceNew:    true,
+		Description: `The number of instances to create.`,
+	}
+	s["min_count"] = &schema.Schema{
+		Type:        schema.TypeInt,
+		Optional:    true,
+		ForceNew:    true,
+		Description: `The minimum number of instances to create. If not specified, instance_count is used as the default. If min_count instances cannot be created, no instances will be created and any already created will be deleted.`,
+	}
+	s["source_instance_template"] = &schema.Schema{
+		Type:        schema.TypeString,
+		Optional:    true,
+		ForceNew:    true,
+		Description: `Name or self link of an instance template to create the instances based on. If provided, instance_properties can override specific values.`,
+	}
+	s["request_id"] = &schema.Schema{
+		Type:         schema.TypeString,
+		Optional:     true,
+		ForceNew:     true,
+		ValidateFunc: validateBulkInsertRequestId,
+		Description:  `An optional request ID (RFC 4122 UUID) for the bulkInsert requestId query parameter; required format when set.`,
+	}
+	s["location_policy"] = &schema.Schema{
+		Type:        schema.TypeList,
+		Optional:    true,
+		ForceNew:    true,
+		MaxItems:    1,
+		Description: `Not supported on zonal instances.bulkInsert; if set, plan fails. This resource only calls the zonal bulk insert API.`,
+		Elem: &schema.Resource{
+			Schema: map[string]*schema.Schema{
+				"target_shape": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					ForceNew:    true,
+					Description: `Strategy for distributing VMs across zones.`,
+				},
+				"location": {
+					Type:        schema.TypeList,
+					Optional:    true,
+					ForceNew:    true,
+					Description: `Per-zone preferences and constraints keyed by zone URL.`,
+					Elem: &schema.Resource{
+						Schema: map[string]*schema.Schema{
+							"zone": {
+								Type:        schema.TypeString,
+								Required:    true,
+								ForceNew:    true,
+								Description: `The zone URL, for example zones/us-central1-a.`,
+							},
+							"preference": {
+								Type:        schema.TypeString,
+								Optional:    true,
+								ForceNew:    true,
+								Description: `Preference for this zone. Supported values are ALLOW and DENY.`,
+							},
+							"max_count": {
+								Type:        schema.TypeInt,
+								Optional:    true,
+								ForceNew:    true,
+								Description: `Maximum number of instances allowed in this zone.`,
+							},
+						},
+					},
+				},
+				"zones": {
+					Type:        schema.TypeList,
+					Optional:    true,
+					ForceNew:    true,
+					Description: `Explicit zones to include in the location policy.`,
+					Elem: &schema.Resource{
+						Schema: map[string]*schema.Schema{
+							"zone": {
+								Type:        schema.TypeString,
+								Required:    true,
+								ForceNew:    true,
+								Description: `The zone URL, for example zones/us-central1-a.`,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	s["instance_flexibility_policy"] = &schema.Schema{
+		Type:        schema.TypeList,
+		Optional:    true,
+		ForceNew:    true,
+		MaxItems:    1,
+		Description: `Not supported on zonal instances.bulkInsert; if set, plan fails. This resource only calls the zonal bulk insert API.`,
+		Elem: &schema.Resource{
+			Schema: map[string]*schema.Schema{
+				"instance_selection": {
+					Type:        schema.TypeList,
+					Optional:    true,
+					ForceNew:    true,
+					Description: `Alternative machine type selections ordered by rank.`,
+					Elem: &schema.Resource{
+						Schema: map[string]*schema.Schema{
+							"name": {
+								Type:        schema.TypeString,
+								Required:    true,
+								ForceNew:    true,
+								Description: `An arbitrary RFC1035 identifier for this instance selection.`,
+							},
+							"machine_types": {
+								Type:        schema.TypeList,
+								Required:    true,
+								ForceNew:    true,
+								Elem:        &schema.Schema{Type: schema.TypeString},
+								Description: `Alternative machine types to use for this selection.`,
+							},
+							"rank": {
+								Type:        schema.TypeInt,
+								Optional:    true,
+								ForceNew:    true,
+								Description: `Priority for this selection. Lower ranks are considered first.`,
+							},
+							"disk": {
+								Type:        schema.TypeList,
+								Optional:    true,
+								ForceNew:    true,
+								Description: `Existing disks to attach for this selection (overrides instanceProperties disks when this selection is chosen).`,
+								Elem: &schema.Resource{
+									Schema: map[string]*schema.Schema{
+										"source": {
+											Type:        schema.TypeString,
+											Required:    true,
+											ForceNew:    true,
+											Description: `URL or name of the existing persistent disk.`,
+										},
+										"mode": {
+											Type:        schema.TypeString,
+											Optional:    true,
+											ForceNew:    true,
+											Description: `READ_WRITE or READ_ONLY.`,
+										},
+										"device_name": {
+											Type:        schema.TypeString,
+											Optional:    true,
+											ForceNew:    true,
+											Description: `Device name exposed to the guest OS.`,
+										},
+										"force_attach": {
+											Type:        schema.TypeBool,
+											Optional:    true,
+											ForceNew:    true,
+											Description: `Attach even if the disk is already attached to another resource.`,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	s["current_instance_count"] = &schema.Schema{
+		Type:        schema.TypeInt,
+		Computed:    true,
+		Description: `The number of instances currently tracked by this bulk insert resource.`,
+	}
+	s["instance_names"] = &schema.Schema{
+		Type:        schema.TypeList,
+		Computed:    true,
+		Elem:        &schema.Schema{Type: schema.TypeString},
+		Description: `The names of instances currently tracked by this bulk insert resource.`,
+	}
+
+	return s
+}
+
+func namePatternToRegex(pattern string) (string, error) {
+	if !bulkInstanceNamePatternRe.MatchString(pattern) {
+		return "", fmt.Errorf("name_pattern must contain exactly one continuous sequence of # characters")
+	}
+
+	match := bulkInstanceHashPlaceholderRe.FindStringIndex(pattern)
+	if match == nil {
+		return "", fmt.Errorf("name_pattern must contain at least one # character")
+	}
+	if match[1]-match[0] > 18 {
+		return "", fmt.Errorf("name_pattern can contain at most 18 consecutive # characters")
+	}
+
+	digitPattern := "[0-9]{" + fmt.Sprintf("%d", match[1]-match[0]) + "}"
+	return regexp.QuoteMeta(pattern[:match[0]]) + digitPattern + regexp.QuoteMeta(pattern[match[1]:]), nil
+}
+
+func listBulkInstancesMatchingPattern(config *transport_tpg.Config, project, zone, pattern, userAgent string) ([]*compute.Instance, error) {
+	patternRegex, err := namePatternToRegex(pattern)
+	if err != nil {
+		return nil, err
+	}
+
+	re, err := regexp.Compile("^" + patternRegex + "$")
+	if err != nil {
+		return nil, fmt.Errorf("invalid name pattern: %s", err)
+	}
+
+	var matchingInstances []*compute.Instance
+	pageToken := ""
+	for {
+		listCall := config.NewComputeClient(userAgent).Instances.List(project, zone)
+		if pageToken != "" {
+			listCall = listCall.PageToken(pageToken)
+		}
+		instances, err := listCall.Do()
+		if err != nil {
+			return nil, err
+		}
+		for _, inst := range instances.Items {
+			if re.MatchString(inst.Name) {
+				matchingInstances = append(matchingInstances, inst)
+			}
+		}
+		if instances.NextPageToken == "" {
+			break
+		}
+		pageToken = instances.NextPageToken
+	}
+
+	return matchingInstances, nil
+}
+
+func listBulkInstancesWithNames(config *transport_tpg.Config, project, zone string, names []string, userAgent string) ([]*compute.Instance, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+
+	nameSet := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if name != "" {
+			nameSet[name] = struct{}{}
+		}
+	}
+
+	var matchingInstances []*compute.Instance
+	pageToken := ""
+	for {
+		listCall := config.NewComputeClient(userAgent).Instances.List(project, zone)
+		if pageToken != "" {
+			listCall = listCall.PageToken(pageToken)
+		}
+		instances, err := listCall.Do()
+		if err != nil {
+			return nil, err
+		}
+		for _, inst := range instances.Items {
+			if _, ok := nameSet[inst.Name]; ok {
+				matchingInstances = append(matchingInstances, inst)
+			}
+		}
+		if instances.NextPageToken == "" {
+			break
+		}
+		pageToken = instances.NextPageToken
+	}
+
+	return matchingInstances, nil
+}
+
+func listTrackedBulkInstances(config *transport_tpg.Config, project, zone, namePattern string, explicitNames []string, userAgent string) ([]*compute.Instance, error) {
+	trackedByName := make(map[string]*compute.Instance)
+
+	if namePattern != "" {
+		matchingInstances, err := listBulkInstancesMatchingPattern(config, project, zone, namePattern, userAgent)
+		if err != nil {
+			return nil, err
+		}
+		for _, inst := range matchingInstances {
+			if inst != nil && inst.Name != "" {
+				trackedByName[inst.Name] = inst
+			}
+		}
+	}
+
+	if len(explicitNames) > 0 {
+		matchingInstances, err := listBulkInstancesWithNames(config, project, zone, explicitNames, userAgent)
+		if err != nil {
+			return nil, err
+		}
+		for _, inst := range matchingInstances {
+			if inst != nil && inst.Name != "" {
+				trackedByName[inst.Name] = inst
+			}
+		}
+	}
+
+	names := make([]string, 0, len(trackedByName))
+	for name := range trackedByName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	instances := make([]*compute.Instance, 0, len(names))
+	for _, name := range names {
+		instances = append(instances, trackedByName[name])
+	}
+	return instances, nil
+}
+
+func sortedBulkInstanceNames(instances []*compute.Instance) []string {
+	names := make([]string, 0, len(instances))
+	for _, inst := range instances {
+		if inst != nil && inst.Name != "" {
+			names = append(names, inst.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func expandBulkInstanceStateNames(d *schema.ResourceData) []string {
+	rawNames := d.Get("instance_names").([]interface{})
+	names := make([]string, 0, len(rawNames))
+	for _, rawName := range rawNames {
+		name, ok := rawName.(string)
+		if ok && name != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func setBulkInstanceState(d *schema.ResourceData, instances []*compute.Instance) error {
+	names := sortedBulkInstanceNames(instances)
+	if err := d.Set("instance_names", names); err != nil {
+		return err
+	}
+	if err := d.Set("current_instance_count", len(names)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func normalizeBulkInsertStringMap(raw interface{}) map[string]string {
+	normalized := make(map[string]string)
+	rawMap, ok := raw.(map[string]interface{})
+	if !ok || rawMap == nil {
+		return normalized
+	}
+
+	for key, value := range rawMap {
+		stringValue, ok := value.(string)
+		if !ok {
+			continue
+		}
+		normalized[key] = stringValue
+	}
+
+	return normalized
+}
+
+func expandBulkInstancePerInstanceProperties(d *schema.ResourceData) map[string]compute.BulkInsertInstanceResourcePerInstanceProperties {
+	normalized := normalizeBulkInsertStringMap(d.Get("per_instance_properties"))
+	if len(normalized) == 0 {
+		return nil
+	}
+
+	expanded := make(map[string]compute.BulkInsertInstanceResourcePerInstanceProperties, len(normalized))
+	for name, hostname := range normalized {
+		props := compute.BulkInsertInstanceResourcePerInstanceProperties{}
+		// Instance names are the JSON object keys in perInstanceProperties. The Go
+		// client's BulkInsertInstanceResourcePerInstanceProperties.Name field is
+		// documented as output-only/temporary, so we only set Hostname here.
+		if hostname != "" {
+			props.Hostname = hostname
+		}
+		expanded[name] = props
+	}
+	return expanded
+}
+
+func configuredBulkPerInstanceNames(d *schema.ResourceData) []string {
+	normalized := normalizeBulkInsertStringMap(d.Get("per_instance_properties"))
+	names := make([]string, 0, len(normalized))
+	for name := range normalized {
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func bulkInstanceResourceID(project, zone, namePattern string, instanceNames []string) string {
+	if namePattern != "" {
+		return fmt.Sprintf("projects/%s/zones/%s/bulkInstances/%s", project, zone, namePattern)
+	}
+	return fmt.Sprintf("projects/%s/zones/%s/bulkInstances/named/%s", project, zone, strings.Join(instanceNames, ","))
+}
+
+func expandBulkInsertLocationPolicy(d *schema.ResourceData) *compute.LocationPolicy {
+	rawPolicies, ok := d.GetOk("location_policy")
+	if !ok {
+		return nil
+	}
+	policies := rawPolicies.([]interface{})
+	if len(policies) == 0 || policies[0] == nil {
+		return nil
+	}
+
+	policyMap := policies[0].(map[string]interface{})
+	locationPolicy := &compute.LocationPolicy{}
+
+	if v, ok := policyMap["target_shape"].(string); ok && v != "" {
+		locationPolicy.TargetShape = v
+	}
+
+	if rawLocations, ok := policyMap["location"].([]interface{}); ok && len(rawLocations) > 0 {
+		locations := make(map[string]compute.LocationPolicyLocation, len(rawLocations))
+		for _, rawLocation := range rawLocations {
+			if rawLocation == nil {
+				continue
+			}
+			locationMap := rawLocation.(map[string]interface{})
+			zone, _ := locationMap["zone"].(string)
+			if zone == "" {
+				continue
+			}
+			location := compute.LocationPolicyLocation{}
+			if v, ok := locationMap["preference"].(string); ok && v != "" {
+				location.Preference = v
+			}
+			if v, ok := locationMap["max_count"].(int); ok {
+				location.Constraints = &compute.LocationPolicyLocationConstraints{MaxCount: int64(v)}
+			}
+			locations[zone] = location
+		}
+		if len(locations) > 0 {
+			locationPolicy.Locations = locations
+		}
+	}
+
+	if rawZones, ok := policyMap["zones"].([]interface{}); ok && len(rawZones) > 0 {
+		zones := make([]*compute.LocationPolicyZoneConfiguration, 0, len(rawZones))
+		for _, rawZone := range rawZones {
+			if rawZone == nil {
+				continue
+			}
+			zoneMap := rawZone.(map[string]interface{})
+			zone, _ := zoneMap["zone"].(string)
+			if zone == "" {
+				continue
+			}
+			zones = append(zones, &compute.LocationPolicyZoneConfiguration{Zone: zone})
+		}
+		if len(zones) > 0 {
+			locationPolicy.Zones = zones
+		}
+	}
+
+	if locationPolicy.TargetShape == "" && len(locationPolicy.Locations) == 0 && len(locationPolicy.Zones) == 0 {
+		return nil
+	}
+	return locationPolicy
+}
+
+func expandBulkInsertInstanceFlexibilityPolicy(d *schema.ResourceData, config *transport_tpg.Config) (*compute.InstanceFlexibilityPolicy, error) {
+	rawPolicies, ok := d.GetOk("instance_flexibility_policy")
+	if !ok {
+		return nil, nil
+	}
+	policies := rawPolicies.([]interface{})
+	if len(policies) == 0 || policies[0] == nil {
+		return nil, nil
+	}
+
+	policyMap := policies[0].(map[string]interface{})
+	rawSelections, ok := policyMap["instance_selection"].([]interface{})
+	if !ok || len(rawSelections) == 0 {
+		return nil, nil
+	}
+
+	selections := make(map[string]compute.InstanceFlexibilityPolicyInstanceSelection, len(rawSelections))
+	for _, rawSelection := range rawSelections {
+		if rawSelection == nil {
+			continue
+		}
+		selectionMap := rawSelection.(map[string]interface{})
+		name, _ := selectionMap["name"].(string)
+		if name == "" {
+			continue
+		}
+
+		selection := compute.InstanceFlexibilityPolicyInstanceSelection{}
+		if rawMachineTypes, ok := selectionMap["machine_types"].([]interface{}); ok && len(rawMachineTypes) > 0 {
+			machineTypes := make([]string, 0, len(rawMachineTypes))
+			for _, rawMachineType := range rawMachineTypes {
+				machineType, ok := rawMachineType.(string)
+				if ok && machineType != "" {
+					machineTypes = append(machineTypes, machineType)
+				}
+			}
+			selection.MachineTypes = machineTypes
+		}
+		if v, ok := selectionMap["rank"].(int); ok {
+			selection.Rank = int64(v)
+		}
+		if rawDisks, ok := selectionMap["disk"].([]interface{}); ok && len(rawDisks) > 0 {
+			flexDisks := make([]*compute.AttachedDisk, 0, len(rawDisks))
+			for _, rawDisk := range rawDisks {
+				if rawDisk == nil {
+					continue
+				}
+				diskMap := rawDisk.(map[string]interface{})
+				src, _ := diskMap["source"].(string)
+				if src == "" {
+					continue
+				}
+				diskCfg := map[string]interface{}{"source": src}
+				if v, ok := diskMap["mode"]; ok {
+					diskCfg["mode"] = v
+				}
+				if v, ok := diskMap["device_name"]; ok {
+					diskCfg["device_name"] = v
+				}
+				if v, ok := diskMap["force_attach"]; ok {
+					diskCfg["force_attach"] = v
+				}
+				ad, err := expandAttachedDisk(diskCfg, d, config)
+				if err != nil {
+					return nil, fmt.Errorf("instance_flexibility_policy disk %q: %w", name, err)
+				}
+				flexDisks = append(flexDisks, ad)
+			}
+			if len(flexDisks) > 0 {
+				selection.Disks = sanitizeBulkInsertDisks(flexDisks)
+			}
+		}
+		selections[name] = selection
+	}
+
+	if len(selections) == 0 {
+		return nil, nil
+	}
+	return &compute.InstanceFlexibilityPolicy{InstanceSelections: selections}, nil
+}
+
+func expandBulkInsertMetadata(d *schema.ResourceData) (*compute.Metadata, error) {
+	mdMap := normalizeBulkInsertStringMap(d.Get("metadata"))
+	if v, ok := d.GetOk("metadata_startup_script"); ok {
+		if startupScript, ok := v.(string); ok && startupScript != "" {
+			if existing, ok := mdMap["startup-script"]; ok && existing != startupScript {
+				return nil, fmt.Errorf("Cannot provide both metadata_startup_script and metadata.startup-script.")
+			}
+			mdMap["startup-script"] = startupScript
+		}
+	}
+
+	if len(mdMap) == 0 {
+		return nil, nil
+	}
+
+	keys := make([]string, 0, len(mdMap))
+	for key := range mdMap {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	items := make([]*compute.MetadataItems, 0, len(keys))
+	for _, key := range keys {
+		value := mdMap[key]
+		valueCopy := value
+		items = append(items, &compute.MetadataItems{
+			Key:   key,
+			Value: &valueCopy,
+		})
+	}
+
+	return &compute.Metadata{Items: items}, nil
+}
+
+func expandBulkInsertTags(d *schema.ResourceData) *compute.Tags {
+	rawTags, ok := d.GetOk("tags")
+	if !ok || rawTags == nil {
+		return nil
+	}
+
+	vs, ok := rawTags.(*schema.Set)
+	if !ok || vs == nil || vs.Len() == 0 {
+		return nil
+	}
+
+	items := make([]string, 0, vs.Len())
+	for _, raw := range vs.List() {
+		if raw == nil {
+			continue
+		}
+		tag, ok := raw.(string)
+		if !ok || tag == "" {
+			continue
+		}
+		items = append(items, tag)
+	}
+
+	if len(items) == 0 {
+		return nil
+	}
+
+	return &compute.Tags{Items: items}
+}
+
+func expandBulkInsertServiceAccounts(d *schema.ResourceData) []*compute.ServiceAccount {
+	rawConfigs := d.Get("service_account").([]interface{})
+	if len(rawConfigs) == 0 {
+		return nil
+	}
+
+	accounts := make([]*compute.ServiceAccount, 0, len(rawConfigs))
+	for _, raw := range rawConfigs {
+		if raw == nil {
+			continue
+		}
+
+		data, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		account := &compute.ServiceAccount{}
+		if rawEmail, ok := data["email"]; ok && rawEmail != nil {
+			if email, ok := rawEmail.(string); ok && email != "" {
+				account.Email = email
+			}
+		}
+		if rawScopes, ok := data["scopes"]; ok && rawScopes != nil {
+			if scopes, ok := rawScopes.(*schema.Set); ok && scopes != nil {
+				account.Scopes = tpgresource.CanonicalizeServiceScopes(tpgresource.ConvertStringSet(scopes))
+			}
+		}
+
+		if account.Email == "" && len(account.Scopes) == 0 {
+			continue
+		}
+		accounts = append(accounts, account)
+	}
+
+	if len(accounts) == 0 {
+		return nil
+	}
+
+	return accounts
+}
+
+func sanitizeBulkInsertDisks(disks []*compute.AttachedDisk) []*compute.AttachedDisk {
+	sanitized := make([]*compute.AttachedDisk, len(disks))
+	for i, disk := range disks {
+		diskCopy := *disk
+		if diskCopy.DiskEncryptionKey != nil {
+			keyCopy := *diskCopy.DiskEncryptionKey
+			keyCopy.RawKey = ""
+			keyCopy.RsaEncryptedKey = ""
+			diskCopy.DiskEncryptionKey = &keyCopy
+		}
+		if diskCopy.InitializeParams != nil && diskCopy.InitializeParams.SourceImageEncryptionKey != nil {
+			keyCopy := *diskCopy.InitializeParams.SourceImageEncryptionKey
+			keyCopy.RawKey = ""
+			keyCopy.RsaEncryptedKey = ""
+			diskCopy.InitializeParams.SourceImageEncryptionKey = &keyCopy
+		}
+		if diskCopy.InitializeParams != nil && diskCopy.InitializeParams.SourceSnapshotEncryptionKey != nil {
+			keyCopy := *diskCopy.InitializeParams.SourceSnapshotEncryptionKey
+			keyCopy.RawKey = ""
+			keyCopy.RsaEncryptedKey = ""
+			diskCopy.InitializeParams.SourceSnapshotEncryptionKey = &keyCopy
+		}
+		if diskCopy.InitializeParams != nil && diskCopy.InitializeParams.DiskType != "" {
+			diskCopy.InitializeParams.DiskType = tpgresource.GetResourceNameFromSelfLink(diskCopy.InitializeParams.DiskType)
+		}
+		sanitized[i] = &diskCopy
+	}
+	return sanitized
+}
+
+func sanitizeBulkInsertGuestAccelerators(accels []*compute.AcceleratorConfig) []*compute.AcceleratorConfig {
+	if len(accels) == 0 {
+		return accels
+	}
+	out := make([]*compute.AcceleratorConfig, len(accels))
+	for i, a := range accels {
+		if a == nil {
+			continue
+		}
+		cp := *a
+		cp.AcceleratorType = tpgresource.GetResourceNameFromSelfLink(a.AcceleratorType)
+		if cp.AcceleratorType == "" {
+			cp.AcceleratorType = a.AcceleratorType
+		}
+		out[i] = &cp
+	}
+	return out
+}
+
+func sanitizeBulkInsertResourcePolicies(policies []string) []string {
+	if len(policies) == 0 {
+		return policies
+	}
+	out := make([]string, len(policies))
+	for i, p := range policies {
+		name := tpgresource.GetResourceNameFromSelfLink(p)
+		if name == "" {
+			name = p
+		}
+		out[i] = name
+	}
+	return out
+}
+
+func rawConfigHasTopLevelAttr(d *schema.ResourceData, attr string) bool {
+	rawConfig := d.GetRawConfig()
+	if rawConfig.IsNull() {
+		return false
+	}
+
+	return !rawConfig.GetAttr(attr).IsNull()
+}
+
+func setBulkInsertSchedulingLocationHint(d *schema.ResourceData, scheduling *compute.Scheduling) {
+	if scheduling == nil {
+		return
+	}
+
+	if v, ok := d.GetOkExists("scheduling.0.location_hint"); ok {
+		scheduling.LocationHint = v.(string)
+		scheduling.ForceSendFields = append(scheduling.ForceSendFields, "LocationHint")
+	}
+}
+
+func expandBulkInsertWorkloadIdentityConfig(d *schema.ResourceData) *compute.WorkloadIdentityConfig {
+	if _, ok := d.GetOk("workload_identity_config"); !ok {
+		return nil
+	}
+
+	config := &compute.WorkloadIdentityConfig{}
+	prefix := "workload_identity_config.0"
+	if v, ok := d.GetOkExists(prefix + ".identity"); ok {
+		config.Identity = v.(string)
+		config.ForceSendFields = append(config.ForceSendFields, "Identity")
+	}
+	if v, ok := d.GetOkExists(prefix + ".identity_certificate_enabled"); ok {
+		config.IdentityCertificateEnabled = v.(bool)
+		config.ForceSendFields = append(config.ForceSendFields, "IdentityCertificateEnabled")
+	}
+
+	return config
+}
+
+func resourceComputeBulkInstanceCreate(d *schema.ResourceData, meta interface{}) error {
+	config := meta.(*transport_tpg.Config)
+	userAgent, err := tpgresource.GenerateUserAgentString(d, config.UserAgent)
+	if err != nil {
+		return err
+	}
+
+	project, err := tpgresource.GetProject(d, config)
+	if err != nil {
+		return err
+	}
+
+	z, err := tpgresource.GetZone(d, config)
+	if err != nil {
+		return err
+	}
+
+	bulkReq := &compute.BulkInsertInstanceResource{
+		Count:       int64(d.Get("instance_count").(int)),
+		NamePattern: d.Get("name_pattern").(string),
+	}
+	explicitNames := configuredBulkPerInstanceNames(d)
+	if perInstanceProperties := expandBulkInstancePerInstanceProperties(d); len(perInstanceProperties) > 0 {
+		bulkReq.PerInstanceProperties = perInstanceProperties
+	}
+
+	if v, ok := d.GetOk("min_count"); ok {
+		bulkReq.MinCount = int64(v.(int))
+	}
+
+	if v, ok := d.GetOk("source_instance_template"); ok {
+		sourceTemplate := v.(string)
+		tpl, err := tpgresource.ParseInstanceTemplateFieldValue(sourceTemplate, d, config)
+		if err != nil {
+			return err
+		}
+		bulkReq.SourceInstanceTemplate = tpl.RelativeLink()
+	}
+
+	if locationPolicy := expandBulkInsertLocationPolicy(d); locationPolicy != nil {
+		bulkReq.LocationPolicy = locationPolicy
+	}
+
+	instanceFlexibilityPolicy, err := expandBulkInsertInstanceFlexibilityPolicy(d, config)
+	if err != nil {
+		return err
+	}
+	if instanceFlexibilityPolicy != nil {
+		bulkReq.InstanceFlexibilityPolicy = instanceFlexibilityPolicy
+	}
+
+	if bulkReq.SourceInstanceTemplate == "" {
+		if _, hasBootDisk := d.GetOk("boot_disk"); !hasBootDisk {
+			return fmt.Errorf("either boot_disk (with machine_type, network_interface) or source_instance_template is required")
+		}
+		instanceProperties, err := expandComputeInstancePropertiesForBulkInsert(project, d, config)
+		if err != nil {
+			return err
+		}
+		bulkReq.InstanceProperties = instanceProperties
+	} else {
+		// When using a source template, only send explicitly configured overrides.
+		// This preserves bulkInsert JSON Merge Patch semantics and avoids injecting
+		// instance-schema defaults like scheduling.automatic_restart.
+		instanceProperties, err := expandComputeInstancePropertyOverridesForBulkInsert(project, d, config)
+		if err != nil {
+			return err
+		}
+		bulkReq.InstanceProperties = instanceProperties
+	}
+
+	requestURL, err := tpgresource.ReplaceVars(d, config, "{{"{{"}}ComputeBasePath{{"}}"}}projects/{{"{{"}}project{{"}}"}}/zones/{{"{{"}}zone{{"}}"}}/instances/bulkInsert")
+	if err != nil {
+		return err
+	}
+	if v, ok := d.GetOk("request_id"); ok {
+		requestID := v.(string)
+		if requestID != "" {
+			requestURL = fmt.Sprintf("%s?requestId=%s", requestURL, neturl.QueryEscape(requestID))
+		}
+	}
+
+	body, err := json.Marshal(bulkReq)
+	if err != nil {
+		return fmt.Errorf("Error marshaling bulk insert request: %s", err)
+	}
+
+	var bodyMap map[string]interface{}
+	if err := json.Unmarshal(body, &bodyMap); err != nil {
+		return fmt.Errorf("Error converting bulk insert request to map: %s", err)
+	}
+
+	log.Printf("[INFO] Requesting bulk instance creation with count=%d, name_pattern=%s, explicit_names=%d", bulkReq.Count, bulkReq.NamePattern, len(explicitNames))
+
+	res, err := transport_tpg.SendRequest(transport_tpg.SendRequestOptions{
+		Config:    config,
+		Method:    "POST",
+		Project:   project,
+		RawURL:    requestURL,
+		UserAgent: userAgent,
+		Body:      bodyMap,
+		Timeout:   d.Timeout(schema.TimeoutCreate),
+	})
+	if err != nil {
+		return fmt.Errorf("Error creating bulk instances: %s", err)
+	}
+
+	err = ComputeOperationWaitTime(config, res, project, "bulk instances to create", userAgent, d.Timeout(schema.TimeoutCreate))
+	if err != nil {
+		return err
+	}
+
+	createdInstances, err := listTrackedBulkInstances(config, project, z, bulkReq.NamePattern, explicitNames, userAgent)
+	if err != nil {
+		return fmt.Errorf("Error listing created bulk instances: %s", err)
+	}
+	if len(createdInstances) == 0 {
+		return fmt.Errorf("bulkInsert completed but no created instances were found")
+	}
+	d.SetId(bulkInstanceResourceID(project, z, bulkReq.NamePattern, sortedBulkInstanceNames(createdInstances)))
+	if err := setBulkInstanceState(d, createdInstances); err != nil {
+		d.SetId("")
+		return err
+	}
+
+	return resourceComputeBulkInstanceRead(d, meta)
+}
+
+func resourceComputeBulkInstanceRead(d *schema.ResourceData, meta interface{}) error {
+	config := meta.(*transport_tpg.Config)
+	userAgent, err := tpgresource.GenerateUserAgentString(d, config.UserAgent)
+	if err != nil {
+		return err
+	}
+
+	project, err := tpgresource.GetProject(d, config)
+	if err != nil {
+		return err
+	}
+
+	z, err := tpgresource.GetZone(d, config)
+	if err != nil {
+		return err
+	}
+
+	namePattern := d.Get("name_pattern").(string)
+	stateNames := expandBulkInstanceStateNames(d)
+	explicitNames := configuredBulkPerInstanceNames(d)
+	if len(explicitNames) == 0 && len(stateNames) > 0 {
+		explicitNames = stateNames
+	}
+	expectedCount := d.Get("instance_count").(int)
+	matchingInstances, err := listTrackedBulkInstances(config, project, z, namePattern, explicitNames, userAgent)
+	if err != nil {
+		return fmt.Errorf("Error listing instances: %s", err)
+	}
+
+	currentInstances := matchingInstances
+	if len(stateNames) > 0 {
+		matchingByName := make(map[string]*compute.Instance, len(matchingInstances))
+		for _, inst := range matchingInstances {
+			matchingByName[inst.Name] = inst
+		}
+
+		currentInstances = make([]*compute.Instance, 0, len(stateNames))
+		for _, name := range stateNames {
+			if inst, ok := matchingByName[name]; ok {
+				currentInstances = append(currentInstances, inst)
+			}
+		}
+	}
+
+	if len(currentInstances) == 0 {
+		log.Printf("[WARN] No tracked bulk instances found - resource may have been deleted")
+		d.SetId("")
+		return nil
+	}
+
+	if len(currentInstances) != expectedCount {
+		log.Printf("[WARN] Expected %d tracked bulk instances, found %d", expectedCount, len(currentInstances))
+	}
+
+	if err := setBulkInstanceState(d, currentInstances); err != nil {
+		return err
+	}
+	return nil
+}
+
+func resourceComputeBulkInstanceDelete(d *schema.ResourceData, meta interface{}) error {
+	config := meta.(*transport_tpg.Config)
+	userAgent, err := tpgresource.GenerateUserAgentString(d, config.UserAgent)
+	if err != nil {
+		return err
+	}
+
+	project, err := tpgresource.GetProject(d, config)
+	if err != nil {
+		return err
+	}
+
+	z, err := tpgresource.GetZone(d, config)
+	if err != nil {
+		return err
+	}
+
+	instanceNames := expandBulkInstanceStateNames(d)
+	if len(instanceNames) == 0 {
+		matchingInstances, err := listTrackedBulkInstances(config, project, z, d.Get("name_pattern").(string), configuredBulkPerInstanceNames(d), userAgent)
+		if err != nil {
+			return fmt.Errorf("Error listing instances for deletion: %s", err)
+		}
+		instanceNames = sortedBulkInstanceNames(matchingInstances)
+	}
+
+	for _, name := range instanceNames {
+		log.Printf("[INFO] Deleting instance %s", name)
+		op, err := config.NewComputeClient(userAgent).Instances.Delete(project, z, name).Do()
+		if err != nil {
+			if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == 404 {
+				continue
+			}
+			return fmt.Errorf("Error deleting instance %s: %s", name, err)
+		}
+		err = ComputeOperationWaitTime(config, op, project, "instance to delete", userAgent, d.Timeout(schema.TimeoutDelete))
+		if err != nil {
+			return fmt.Errorf("Error waiting for instance %s to delete: %s", name, err)
+		}
+	}
+
+	d.SetId("")
+	return nil
+}
+
+func expandComputeInstancePropertiesForBulkInsert(project string, d *schema.ResourceData, config *transport_tpg.Config) (*compute.InstanceProperties, error) {
+	var machineTypeURL string
+	if mt, ok := d.GetOk("machine_type"); ok {
+		machineType, err := tpgresource.ParseMachineTypesFieldValue(mt.(string), d, config)
+		if err != nil {
+			return nil, fmt.Errorf("Error loading machine type: %s", err)
+		}
+		machineTypeURL = machineType.RelativeLink()
+	}
+
+	disks := []*compute.AttachedDisk{}
+	if _, hasBootDisk := d.GetOk("boot_disk"); hasBootDisk {
+		bootDisk, err := expandBootDisk(d, config, project)
+		if err != nil {
+			return nil, err
+		}
+		disks = append(disks, bootDisk)
+	}
+	if _, hasScratchDisk := d.GetOk("scratch_disk"); hasScratchDisk {
+		scratchDisks, err := expandScratchDisks(d, config, project)
+		if err != nil {
+			return nil, err
+		}
+		disks = append(disks, scratchDisks...)
+	}
+	attachedDisksCount := d.Get("attached_disk.#").(int)
+	for i := 0; i < attachedDisksCount; i++ {
+		diskConfig := d.Get(fmt.Sprintf("attached_disk.%d", i)).(map[string]interface{})
+		disk, err := expandAttachedDisk(diskConfig, d, config)
+		if err != nil {
+			return nil, err
+		}
+		disks = append(disks, disk)
+	}
+
+	scheduling, err := expandScheduling(d.Get("scheduling"))
+	if err != nil {
+		return nil, fmt.Errorf("Error creating scheduling: %s", err)
+	}
+	setBulkInsertSchedulingLocationHint(d, scheduling)
+	if scheduling != nil && scheduling.ProvisioningModel == "SPOT" {
+		// bulkInsert rejects SPOT when the inherited scheduling helper serializes
+		// the instance-schema default of preemptible=false.
+		scheduling.Preemptible = true
+		scheduling.AutomaticRestart = googleapi.Bool(false)
+		scheduling.OnHostMaintenance = "TERMINATE"
+		scheduling.ForceSendFields = append(
+			scheduling.ForceSendFields,
+			"Preemptible",
+			"AutomaticRestart",
+			"OnHostMaintenance",
+		)
+	}
+	params, err := expandParams(d)
+	if err != nil {
+		return nil, fmt.Errorf("Error creating params: %s", err)
+	}
+	metadata, err := expandBulkInsertMetadata(d)
+	if err != nil {
+		return nil, fmt.Errorf("Error creating metadata: %s", err)
+	}
+	networkInterfaces, err := expandNetworkInterfaces(d, config)
+	if err != nil {
+		return nil, fmt.Errorf("Error creating network interfaces: %s", err)
+	}
+	networkPerformanceConfig, err := expandNetworkPerformanceConfig(d, config)
+	if err != nil {
+		return nil, fmt.Errorf("Error creating network performance config: %s", err)
+	}
+	accels, err := expandInstanceGuestAccelerators(d, config)
+	if err != nil {
+		return nil, fmt.Errorf("Error creating guest accelerators: %s", err)
+	}
+	accels = sanitizeBulkInsertGuestAccelerators(accels)
+	reservationAffinity, err := expandReservationAffinity(d)
+	if err != nil {
+		return nil, fmt.Errorf("Error creating reservation affinity: %s", err)
+	}
+
+	// Machine type for bulkInsert must be name only, not full URL
+	machineType := tpgresource.GetResourceNameFromSelfLink(machineTypeURL)
+	if machineType == "" {
+		machineType = machineTypeURL
+	}
+
+	props := &compute.InstanceProperties{
+		CanIpForward:               d.Get("can_ip_forward").(bool),
+		Description:                d.Get("description").(string),
+		Disks:                      sanitizeBulkInsertDisks(disks),
+		MachineType:                machineType,
+		Metadata:                   metadata,
+		NetworkInterfaces:          networkInterfaces,
+		NetworkPerformanceConfig:   networkPerformanceConfig,
+		Tags:                       expandBulkInsertTags(d),
+		Labels:                     tpgresource.ExpandEffectiveLabels(d),
+		ServiceAccounts:            expandBulkInsertServiceAccounts(d),
+		GuestAccelerators:          accels,
+		MinCpuPlatform:             d.Get("min_cpu_platform").(string),
+		Scheduling:                 scheduling,
+		ConfidentialInstanceConfig: expandConfidentialInstanceConfig(d),
+		AdvancedMachineFeatures:    expandAdvancedMachineFeatures(d),
+		ShieldedInstanceConfig:     expandShieldedVmConfigs(d),
+		ResourcePolicies:           sanitizeBulkInsertResourcePolicies(tpgresource.ConvertStringArr(d.Get("resource_policies").([]interface{}))),
+		ReservationAffinity:        reservationAffinity,
+		KeyRevocationActionType:    d.Get("key_revocation_action_type").(string),
+	}
+	if v, ok := d.GetOkExists("private_ipv6_google_access"); ok {
+		props.PrivateIpv6GoogleAccess = v.(string)
+		props.ForceSendFields = append(props.ForceSendFields, "PrivateIpv6GoogleAccess")
+	}
+	if workloadIdentityConfig := expandBulkInsertWorkloadIdentityConfig(d); workloadIdentityConfig != nil {
+		props.WorkloadIdentityConfig = workloadIdentityConfig
+	}
+	if params != nil && params.ResourceManagerTags != nil {
+		props.ResourceManagerTags = params.ResourceManagerTags
+	}
+	return props, nil
+}
+
+func expandComputeInstancePropertyOverridesForBulkInsert(project string, d *schema.ResourceData, config *transport_tpg.Config) (*compute.InstanceProperties, error) {
+	props := &compute.InstanceProperties{}
+	hasOverrides := false
+
+	if rawConfigHasTopLevelAttr(d, "machine_type") {
+		machineType, err := tpgresource.ParseMachineTypesFieldValue(d.Get("machine_type").(string), d, config)
+		if err != nil {
+			return nil, fmt.Errorf("Error loading machine type: %s", err)
+		}
+		props.MachineType = tpgresource.GetResourceNameFromSelfLink(machineType.RelativeLink())
+		hasOverrides = true
+	}
+
+	disks := []*compute.AttachedDisk{}
+	if _, ok := d.GetOk("boot_disk"); ok {
+		bootDisk, err := expandBootDisk(d, config, project)
+		if err != nil {
+			return nil, err
+		}
+		disks = append(disks, bootDisk)
+	}
+	if _, ok := d.GetOk("scratch_disk"); ok {
+		scratchDisks, err := expandScratchDisks(d, config, project)
+		if err != nil {
+			return nil, err
+		}
+		disks = append(disks, scratchDisks...)
+	}
+	if _, ok := d.GetOk("attached_disk"); ok {
+		attachedDisksCount := d.Get("attached_disk.#").(int)
+		for i := 0; i < attachedDisksCount; i++ {
+			diskConfig := d.Get(fmt.Sprintf("attached_disk.%d", i)).(map[string]interface{})
+			disk, err := expandAttachedDisk(diskConfig, d, config)
+			if err != nil {
+				return nil, err
+			}
+			disks = append(disks, disk)
+		}
+	}
+	if len(disks) > 0 {
+		props.Disks = sanitizeBulkInsertDisks(disks)
+		hasOverrides = true
+	}
+
+	if rawConfigHasTopLevelAttr(d, "can_ip_forward") {
+		props.CanIpForward = d.Get("can_ip_forward").(bool)
+		hasOverrides = true
+	}
+	if rawConfigHasTopLevelAttr(d, "description") {
+		props.Description = d.Get("description").(string)
+		hasOverrides = true
+	}
+	if rawConfigHasTopLevelAttr(d, "metadata") || rawConfigHasTopLevelAttr(d, "metadata_startup_script") {
+		metadata, err := expandBulkInsertMetadata(d)
+		if err != nil {
+			return nil, fmt.Errorf("Error creating metadata: %s", err)
+		}
+		props.Metadata = metadata
+		hasOverrides = true
+	}
+	if _, ok := d.GetOk("network_interface"); ok {
+		networkInterfaces, err := expandNetworkInterfaces(d, config)
+		if err != nil {
+			return nil, fmt.Errorf("Error creating network interfaces: %s", err)
+		}
+		props.NetworkInterfaces = networkInterfaces
+		hasOverrides = true
+	}
+	if _, ok := d.GetOk("network_performance_config"); ok {
+		networkPerformanceConfig, err := expandNetworkPerformanceConfig(d, config)
+		if err != nil {
+			return nil, fmt.Errorf("Error creating network performance config: %s", err)
+		}
+		props.NetworkPerformanceConfig = networkPerformanceConfig
+		hasOverrides = true
+	}
+	if rawConfigHasTopLevelAttr(d, "tags") {
+		props.Tags = expandBulkInsertTags(d)
+		hasOverrides = true
+	}
+	if labels := tpgresource.ExpandEffectiveLabels(d); len(labels) > 0 {
+		props.Labels = labels
+		hasOverrides = true
+	}
+	if _, ok := d.GetOk("service_account"); ok {
+		props.ServiceAccounts = expandBulkInsertServiceAccounts(d)
+		hasOverrides = true
+	}
+	if _, ok := d.GetOk("guest_accelerator"); ok {
+		accels, err := expandInstanceGuestAccelerators(d, config)
+		if err != nil {
+			return nil, fmt.Errorf("Error creating guest accelerators: %s", err)
+		}
+		props.GuestAccelerators = sanitizeBulkInsertGuestAccelerators(accels)
+		hasOverrides = true
+	}
+	if rawConfigHasTopLevelAttr(d, "min_cpu_platform") {
+		props.MinCpuPlatform = d.Get("min_cpu_platform").(string)
+		hasOverrides = true
+	}
+	if _, ok := d.GetOk("scheduling"); ok {
+		scheduling, err := expandScheduling(d.Get("scheduling"))
+		if err != nil {
+			return nil, fmt.Errorf("Error creating scheduling: %s", err)
+		}
+		setBulkInsertSchedulingLocationHint(d, scheduling)
+		if scheduling != nil && scheduling.ProvisioningModel == "SPOT" {
+			scheduling.Preemptible = true
+			scheduling.AutomaticRestart = googleapi.Bool(false)
+			scheduling.OnHostMaintenance = "TERMINATE"
+			scheduling.ForceSendFields = append(
+				scheduling.ForceSendFields,
+				"Preemptible",
+				"AutomaticRestart",
+				"OnHostMaintenance",
+			)
+		}
+		props.Scheduling = scheduling
+		hasOverrides = true
+	}
+	if _, ok := d.GetOk("confidential_instance_config"); ok {
+		props.ConfidentialInstanceConfig = expandConfidentialInstanceConfig(d)
+		hasOverrides = true
+	}
+	if _, ok := d.GetOk("advanced_machine_features"); ok {
+		props.AdvancedMachineFeatures = expandAdvancedMachineFeatures(d)
+		hasOverrides = true
+	}
+	if _, ok := d.GetOk("shielded_instance_config"); ok {
+		props.ShieldedInstanceConfig = expandShieldedVmConfigs(d)
+		hasOverrides = true
+	}
+	if _, ok := d.GetOk("resource_policies"); ok {
+		props.ResourcePolicies = sanitizeBulkInsertResourcePolicies(tpgresource.ConvertStringArr(d.Get("resource_policies").([]interface{})))
+		hasOverrides = true
+	}
+	if _, ok := d.GetOk("reservation_affinity"); ok {
+		reservationAffinity, err := expandReservationAffinity(d)
+		if err != nil {
+			return nil, fmt.Errorf("Error creating reservation affinity: %s", err)
+		}
+		props.ReservationAffinity = reservationAffinity
+		hasOverrides = true
+	}
+	if rawConfigHasTopLevelAttr(d, "key_revocation_action_type") {
+		props.KeyRevocationActionType = d.Get("key_revocation_action_type").(string)
+		hasOverrides = true
+	}
+	if rawConfigHasTopLevelAttr(d, "private_ipv6_google_access") {
+		props.PrivateIpv6GoogleAccess = d.Get("private_ipv6_google_access").(string)
+		props.ForceSendFields = append(props.ForceSendFields, "PrivateIpv6GoogleAccess")
+		hasOverrides = true
+	}
+	if _, ok := d.GetOk("workload_identity_config"); ok {
+		props.WorkloadIdentityConfig = expandBulkInsertWorkloadIdentityConfig(d)
+		hasOverrides = true
+	}
+	if _, ok := d.GetOk("params"); ok {
+		params, err := expandParams(d)
+		if err != nil {
+			return nil, fmt.Errorf("Error creating params: %s", err)
+		}
+		if params != nil && params.ResourceManagerTags != nil {
+			props.ResourceManagerTags = params.ResourceManagerTags
+			hasOverrides = true
+		}
+	}
+
+	if !hasOverrides {
+		return nil, nil
+	}
+
+	return props, nil
+}
